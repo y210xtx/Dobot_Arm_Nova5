@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "saved_at": "2026-08-12T10:48:05",
+  "tool": 1,
+  "active_tool": 1,
+  "offset": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    40.0
+  ],
+  "units": {
+    "X": "mm",
+    "Y": "mm",
+    "Z": "mm",
+    "Rx": "deg",
+    "Ry": "deg",
+    "Rz": "deg"
+  }
+}

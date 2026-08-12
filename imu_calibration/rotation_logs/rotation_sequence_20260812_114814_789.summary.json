@@ -1,0 +1,12 @@
+{
+  "finish_reason": "运动序列已完成",
+  "csv_file": "D:\\Jay\\program\\Dobot_Arm_Ohand_Exc\\imu_calibration\\rotation_logs\\rotation_sequence_20260812_114814_789.csv",
+  "feedback_count": 1791,
+  "actual_angular_speed_norm_deg_s": {
+    "count": 1791,
+    "mean": 14.108181643018122,
+    "std": 0.5001096547224608,
+    "min": 0.0,
+    "max": 14.142135623730951
+  }
+}

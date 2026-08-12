@@ -1,0 +1,12 @@
+{
+  "finish_reason": "旋转失败：RelMovLTool 序列返回错误：-2,{},RelMovLTool(0.000000,0.000000,0.000000,-1.080000,-0.120000,-1.200000,a=30,v=45,cp=100);",
+  "csv_file": "D:\\Jay\\program\\Dobot_Arm_Ohand_Exc\\imu_calibration\\rotation_logs\\rotation_sequence_20260812_114710_229.csv",
+  "feedback_count": 55,
+  "actual_angular_speed_norm_deg_s": {
+    "count": 55,
+    "mean": 11.107490296651061,
+    "std": 3.47013560656991,
+    "min": 0.0,
+    "max": 14.142135623730951
+  }
+}

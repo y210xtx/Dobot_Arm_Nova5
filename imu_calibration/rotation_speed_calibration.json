@@ -4,22 +4,22 @@
     "tool_0_Ry": {
       "tool": 0,
       "axis": "Ry",
-      "deg_s_per_v_at_full_global": 0.9918685945596988,
-      "runs": 18,
-      "last_measured_deg_s": 49.60657067987566,
-      "last_controller_v": 65,
-      "last_global_speed_scale": 0.77,
-      "updated_at": "2026-08-11T09:25:20"
+      "deg_s_per_v_at_full_global": 0.996242496820833,
+      "runs": 27,
+      "last_measured_deg_s": 5.055827335211222,
+      "last_controller_v": 23,
+      "last_global_speed_scale": 0.22,
+      "updated_at": "2026-08-11T16:50:46"
     },
     "tool_0_Rx": {
       "tool": 0,
       "axis": "Rx",
-      "deg_s_per_v_at_full_global": 0.03623678896314675,
-      "runs": 13,
-      "last_measured_deg_s": 0.023408370194550842,
-      "last_controller_v": 100,
-      "last_global_speed_scale": 0.77,
-      "updated_at": "2026-08-11T09:35:29"
+      "deg_s_per_v_at_full_global": 1.0006094183573095,
+      "runs": 38,
+      "last_measured_deg_s": 5.06838674041311,
+      "last_controller_v": 23,
+      "last_global_speed_scale": 0.22,
+      "updated_at": "2026-08-11T17:14:56"
     },
     "jog_tool_0_Ry": {
       "tool": 0,
@@ -33,12 +33,42 @@
     "tool_0_Rz": {
       "tool": 0,
       "axis": "Rz",
-      "deg_s_per_v_at_full_global": 0.9984699068859058,
-      "runs": 3,
-      "last_measured_deg_s": 9.990173162995205,
-      "last_controller_v": 13,
-      "last_global_speed_scale": 0.77,
-      "updated_at": "2026-08-11T09:27:59"
+      "deg_s_per_v_at_full_global": 1.0000922858348062,
+      "runs": 10,
+      "last_measured_deg_s": 5.0578107353319215,
+      "last_controller_v": 23,
+      "last_global_speed_scale": 0.22,
+      "updated_at": "2026-08-11T16:41:51"
+    },
+    "tool_1_Ry": {
+      "tool": 1,
+      "axis": "Ry",
+      "deg_s_per_v_at_full_global": 0.9919007430827402,
+      "runs": 18,
+      "last_measured_deg_s": 5.047631228134307,
+      "last_controller_v": 23,
+      "last_global_speed_scale": 0.22,
+      "updated_at": "2026-08-11T17:21:30"
+    },
+    "tool_1_Rx": {
+      "tool": 1,
+      "axis": "Rx",
+      "deg_s_per_v_at_full_global": 0.999478154842896,
+      "runs": 23,
+      "last_measured_deg_s": 5.058396438293047,
+      "last_controller_v": 23,
+      "last_global_speed_scale": 0.22,
+      "updated_at": "2026-08-12T10:57:00"
+    },
+    "tool_1_Rz": {
+      "tool": 1,
+      "axis": "Rz",
+      "deg_s_per_v_at_full_global": 1.0005429548893487,
+      "runs": 2,
+      "last_measured_deg_s": 5.06359861178315,
+      "last_controller_v": 23,
+      "last_global_speed_scale": 0.22,
+      "updated_at": "2026-08-11T17:11:13"
     }
   }
 }

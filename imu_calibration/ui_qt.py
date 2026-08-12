@@ -12,13 +12,13 @@ import time
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QThread, Qt, Signal
+from PySide6.QtCore import QThread, Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen
 from PySide6.QtCharts import QChart, QChartView, QLineSeries, QValueAxis
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QGridLayout, QGroupBox,
-    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
-    QSplitter, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
+    QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow, QMessageBox,
+    QPushButton, QSplitter, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from dobot_api import DobotApiDashboard, DobotApiFeedBack
@@ -36,6 +36,7 @@ ROBOT_MODES = {
 }
 
 POSE_RECORD_FILE = Path(__file__).resolve().with_name("recorded_pose.json")
+TOOL_OFFSET_FILE = Path(__file__).resolve().with_name("tool_offset_config.json")
 ROTATION_LOG_DIR = Path(__file__).resolve().with_name("rotation_logs")
 ROTATION_SPEED_CALIBRATION_FILE = Path(__file__).resolve().with_name(
     "rotation_speed_calibration.json"
@@ -205,13 +206,13 @@ QLabel[ioValue="true"] {
     font-family: "Cascadia Mono", "Consolas", monospace;
     font-size: 11px;
 }
-QTabWidget::pane {
+QTabWidget#cardTabs::pane {
     border: 1px solid #dfe7f1;
-    border-radius: 8px;
+    border-radius: 10px;
     background: #ffffff;
-    top: -1px;
+    top: 0;
 }
-QTabBar::tab {
+QTabWidget#cardTabs QTabBar::tab {
     min-width: 86px;
     min-height: 26px;
     padding: 2px 12px;
@@ -224,12 +225,12 @@ QTabBar::tab {
     border-top-right-radius: 7px;
     font-weight: 600;
 }
-QTabBar::tab:selected {
+QTabWidget#cardTabs QTabBar::tab:selected {
     color: #0f766e;
     background: #ffffff;
     border-bottom-color: #ffffff;
 }
-QTabBar::tab:hover {
+QTabWidget#cardTabs QTabBar::tab:hover {
     color: #1d4ed8;
     background: #eff6ff;
 }
@@ -592,6 +593,83 @@ class RotationDiagnostics:
         return summary
 
 
+class RotationSequenceDiagnostics:
+    """Record planned and actual angular-velocity vectors for a blended plan."""
+
+    FIELDS = (
+        "event", "pc_time_s", "controller_timestamp", "robot_mode", "segment",
+        "planned_rx_deg_s", "planned_ry_deg_s", "planned_rz_deg_s", "cp",
+        "actual_wx_deg_s", "actual_wy_deg_s", "actual_wz_deg_s", "latency_ms",
+        "response",
+    )
+
+    def __init__(self):
+        ROTATION_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        self.path = ROTATION_LOG_DIR / f"rotation_sequence_{stamp}_{int((time.time() % 1) * 1000):03d}.csv"
+        self.summary_path = self.path.with_suffix(".summary.json")
+        self.started_at = time.perf_counter()
+        self.file = self.path.open("w", newline="", encoding="utf-8-sig")
+        self.writer = csv.DictWriter(self.file, fieldnames=self.FIELDS)
+        self.writer.writeheader()
+        self.lock = threading.Lock()
+        self.closed = False
+        self.current_speed = [0.0, 0.0, 0.0]
+        self.current_segment = 0
+        self.samples = []
+
+    def _write(self, row):
+        self.writer.writerow({field: "" for field in self.FIELDS} | row)
+
+    def log_command(self, elapsed, segment, cp, latency_ms, response):
+        with self.lock:
+            if self.closed:
+                return
+            self.current_speed = [float(value) for value in segment["speed_vector"]]
+            self.current_segment += 1
+            self._write({
+                "event": "command", "pc_time_s": f"{elapsed:.6f}",
+                "segment": self.current_segment, "cp": cp,
+                "planned_rx_deg_s": self.current_speed[0],
+                "planned_ry_deg_s": self.current_speed[1],
+                "planned_rz_deg_s": self.current_speed[2],
+                "latency_ms": f"{latency_ms:.3f}", "response": str(response).strip(),
+            })
+
+    def log_feedback(self, state):
+        with self.lock:
+            if self.closed:
+                return
+            actual = [float(value) for value in state["angular_speed"]]
+            elapsed = time.perf_counter() - self.started_at
+            self.samples.append((elapsed, self.current_segment, *self.current_speed, *actual))
+            self._write({
+                "event": "feedback", "pc_time_s": f"{elapsed:.6f}",
+                "controller_timestamp": state["controller_timestamp"], "robot_mode": state["mode"],
+                "segment": self.current_segment,
+                "planned_rx_deg_s": self.current_speed[0],
+                "planned_ry_deg_s": self.current_speed[1],
+                "planned_rz_deg_s": self.current_speed[2],
+                "actual_wx_deg_s": actual[0], "actual_wy_deg_s": actual[1], "actual_wz_deg_s": actual[2],
+            })
+
+    def finish(self, reason):
+        with self.lock:
+            if self.closed:
+                return None
+            magnitudes = [math.sqrt(x * x + y * y + z * z) for _, _, x, y, z, _, _, _ in self.samples]
+            summary = {
+                "finish_reason": reason, "csv_file": str(self.path),
+                "feedback_count": len(self.samples),
+                "actual_angular_speed_norm_deg_s": RotationDiagnostics._stats(magnitudes),
+            }
+            self.file.flush()
+            self.file.close()
+            self.closed = True
+        self.summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        return summary
+
+
 class RotationThread(QThread):
     """Queue controller-planned relative Tool-axis rotations for IMU calibration."""
 
@@ -774,6 +852,176 @@ class RotationThread(QThread):
             self.rotation_error.emit(str(exc))
 
 
+class RotationPlanThread(QThread):
+    """Queue a finite IMU rotation plan as one blended controller trajectory."""
+
+    progress = Signal(object)
+    rotation_done = Signal(str)
+    rotation_error = Signal(str)
+
+    def __init__(self, client, items, state_provider, cp=100, diagnostics=None, parent=None):
+        super().__init__(parent)
+        self.client = client
+        self.items = [dict(item) for item in items]
+        self.state_provider = state_provider
+        self.cp = int(cp)
+        self.diagnostics = diagnostics
+        self.segment_angle = 170.0
+        self.running = True
+
+    def stop(self):
+        self.running = False
+
+    @staticmethod
+    def _error_id(response):
+        match = re.match(r"\s*(-?\d+)", str(response))
+        return int(match.group(1)) if match else None
+
+    @staticmethod
+    def _offset(axis, angle):
+        values = [0.0] * 6
+        values[{"Rx": 3, "Ry": 4, "Rz": 5}[axis]] = angle
+        return values
+
+    def _segments(self):
+        segments = []
+        for index, item in enumerate(self.items):
+            if item.get("type") == "vector":
+                deltas = [
+                    float(value) * float(item["duration"])
+                    for value in item["angular_speed_vector"]
+                ]
+                max_delta = max(abs(value) for value in deltas)
+                count = max(1, math.ceil(max_delta / self.segment_angle))
+                for _ in range(count):
+                    offset = [0.0, 0.0, 0.0] + [value / count for value in deltas]
+                    segments.append({
+                        "item_index": index,
+                        "axis": "组合",
+                        "angle": math.sqrt(sum(value * value for value in offset[3:])),
+                        "offset": offset,
+                        "controller_v": int(item["controller_v"]),
+                        "speed_vector": list(item["angular_speed_vector"]),
+                    })
+            else:
+                total_angle = abs(item["angular_speed"]) * item["duration"]
+                direction = 1.0 if item["angular_speed"] > 0 else -1.0
+                count = max(1, math.ceil(total_angle / self.segment_angle))
+                amounts = [self.segment_angle] * count
+                amounts[-1] = total_angle - self.segment_angle * (count - 1)
+                for amount in amounts:
+                    segments.append({
+                        "item_index": index,
+                        "axis": item["axis"],
+                        "angle": direction * amount,
+                        "offset": self._offset(item["axis"], direction * amount),
+                        "controller_v": int(item["controller_v"]),
+                        "speed_vector": self._offset(item["axis"], item["angular_speed"])[3:],
+                    })
+        return segments
+
+    def run(self):
+        started_at = time.perf_counter()
+        try:
+            segments = self._segments()
+            if not segments:
+                self.rotation_done.emit("运动序列为空")
+                return
+
+            last_send_started = None
+            for index, segment in enumerate(segments):
+                if not self.running:
+                    break
+                send_started = time.perf_counter()
+                interval_ms = (
+                    None if last_send_started is None
+                    else (send_started - last_send_started) * 1000.0
+                )
+                # Only intermediate queued points blend into their successor; the
+                # last point must finish normally rather than blend past the plan.
+                cp = self.cp if index < len(segments) - 1 else 0
+                response = self.client.RelMovLTool(
+                    *segment["offset"],
+                    user=-1,
+                    tool=-1,
+                    a=30,
+                    v=segment["controller_v"],
+                    cp=cp,
+                )
+                latency_ms = (time.perf_counter() - send_started) * 1000.0
+                error_id = self._error_id(response)
+                if error_id not in (0, None):
+                    raise RuntimeError(f"RelMovLTool 序列返回错误：{response}")
+                if self.diagnostics is not None:
+                    self.diagnostics.log_command(
+                        time.perf_counter() - started_at, segment, cp, latency_ms, response
+                    )
+                self.progress.emit({
+                    "item_index": segment["item_index"],
+                    "axis": segment["axis"],
+                    "angle": segment["angle"],
+                    "phase": "queued",
+                    "interval_ms": interval_ms,
+                    "latency_ms": latency_ms,
+                })
+                last_send_started = send_started
+                self.msleep(5)
+
+            expected_total = sum(item["duration"] for item in self.items)
+            deadline = started_at + max(12.0, expected_total * 4.0 + 8.0)
+            seen_running = False
+            cumulative_times = []
+            total = 0.0
+            for item in self.items:
+                total += item["duration"]
+                cumulative_times.append(total)
+
+            while self.running and time.perf_counter() < deadline:
+                elapsed = time.perf_counter() - started_at
+                mode = self.state_provider()
+                if mode == 7:
+                    seen_running = True
+                item_index = 0
+                for index, end_time in enumerate(cumulative_times):
+                    if elapsed <= end_time:
+                        item_index = index
+                        break
+                else:
+                    item_index = len(self.items) - 1
+                item = self.items[item_index]
+                item_start = 0.0 if item_index == 0 else cumulative_times[item_index - 1]
+                item_elapsed = max(0.0, elapsed - item_start)
+                if item.get("type") == "vector":
+                    speed_norm = math.sqrt(
+                        sum(value * value for value in item["angular_speed_vector"])
+                    )
+                    angle = min(speed_norm * item["duration"], item_elapsed * speed_norm)
+                else:
+                    angle = math.copysign(
+                        min(
+                            abs(item["angular_speed"]) * item["duration"],
+                            item_elapsed * abs(item["angular_speed"]),
+                        ),
+                        item["angular_speed"],
+                    )
+                self.progress.emit({
+                    "item_index": item_index,
+                    "axis": item["axis"],
+                    "angle": angle,
+                    "phase": "running",
+                })
+                if (seen_running and mode == 5) or (elapsed > expected_total + 0.8 and mode == 5):
+                    break
+                self.msleep(50)
+            if self.running and time.perf_counter() >= deadline:
+                raise TimeoutError("等待 IMU 运动序列完成超时")
+
+            message = "运动序列已完成" if self.running else "运动序列已手动停止"
+            self.rotation_done.emit(message)
+        except Exception as exc:
+            self.rotation_error.emit(str(exc))
+
+
 class JogRotationThread(QThread):
     """Controller-internal continuous Tool-axis jog for long IMU sweeps."""
 
@@ -868,7 +1116,13 @@ class RobotUI(QMainWindow):
         self.recorded_user_index = 0
         self.recorded_tool_index = 0
         self.recorded_at = None
+        self.saved_tool_offset = None
         self.rotation_running = False
+        self.rotation_plan_items = []
+        self.rotation_sequence_items = []
+        self.rotation_sequence_index = 0
+        self.rotation_sequence_stopping = False
+        self.rotation_sequence_blended = False
         self.active_rotation_axis = None
         self.active_tool_index = 0
         self.alarm_requested = False
@@ -892,6 +1146,7 @@ class RobotUI(QMainWindow):
         self.servo_alarms = {item["id"]: item for item in alarm_servo_list}
 
         self.build_ui()
+        self.load_tool_offset_config()
         self.load_rotation_speed_calibration()
         self.load_recorded_pose()
         self.set_controls_enabled(False)
@@ -904,73 +1159,94 @@ class RobotUI(QMainWindow):
         root.setContentsMargins(18, 14, 18, 16)
         root.setSpacing(10)
 
-        top_controls = QHBoxLayout()
-        top_controls.setSpacing(10)
-        top_controls.addWidget(self.build_connection_group(), 6)
-        top_controls.addWidget(self.build_dashboard_group(), 5)
-        root.addLayout(top_controls)
-        root.addWidget(self.build_move_group())
+        top_left = QWidget()
+        top_left_layout = QVBoxLayout(top_left)
+        top_left_layout.setContentsMargins(0, 0, 0, 0)
+        top_left_layout.setSpacing(10)
+        top_left_layout.addWidget(self.build_connection_group())
+        top_left_layout.addWidget(self.build_dashboard_group())
+        top_left_layout.addStretch()
 
-        feedback_splitter = QSplitter(Qt.Orientation.Horizontal)
-        feedback_splitter.addWidget(self.build_feedback_group())
-        feedback_splitter.addWidget(self.build_log_group())
-        feedback_splitter.setSizes([800, 440])
-        feedback_splitter.setStretchFactor(0, 2)
-        feedback_splitter.setStretchFactor(1, 1)
-        feedback_splitter.setHandleWidth(8)
-        feedback_splitter.setMinimumHeight(240)
+        log_alarm_splitter = QSplitter(Qt.Orientation.Horizontal)
+        log_alarm_splitter.addWidget(self.build_log_group())
+        log_alarm_splitter.addWidget(self.build_alarm_group())
+        log_alarm_splitter.setSizes([570, 250])
+        log_alarm_splitter.setStretchFactor(0, 1)
+        log_alarm_splitter.setStretchFactor(1, 0)
+        log_alarm_splitter.setHandleWidth(8)
+
+        top_splitter = QSplitter(Qt.Orientation.Horizontal)
+        top_splitter.addWidget(top_left)
+        top_splitter.addWidget(log_alarm_splitter)
+        top_splitter.setSizes([430, 820])
+        top_splitter.setStretchFactor(0, 0)
+        top_splitter.setStretchFactor(1, 1)
+        top_splitter.setHandleWidth(8)
+        top_splitter.setMinimumHeight(250)
 
         content_splitter = QSplitter(Qt.Orientation.Vertical)
-        content_splitter.addWidget(feedback_splitter)
+        content_splitter.addWidget(top_splitter)
+        content_splitter.addWidget(self.build_status_motion_tabs())
         content_splitter.addWidget(self.build_imu_calibration_group())
-        content_splitter.setSizes([260, 410])
+        content_splitter.setSizes([255, 190, 485])
         content_splitter.setStretchFactor(0, 0)
-        content_splitter.setStretchFactor(1, 1)
+        content_splitter.setStretchFactor(1, 0)
+        content_splitter.setStretchFactor(2, 1)
         content_splitter.setHandleWidth(9)
         root.addWidget(content_splitter, 1)
 
         self.setStyleSheet(MODERN_STYLE)
 
+    def build_status_motion_tabs(self):
+        tabs = QTabWidget()
+        tabs.setObjectName("cardTabs")
+        tabs.setDocumentMode(False)
+        tabs.tabBar().setDrawBase(False)
+        tabs.addTab(self.build_move_group(), "运动控制")
+        tabs.addTab(self.build_feedback_group(), "状态反馈")
+        return tabs
+
     def build_connection_group(self):
         group = QGroupBox("机器人连接")
         group.setObjectName("compactCard")
-        row = QHBoxLayout(group)
-        row.setContentsMargins(9, 7, 9, 6)
-        row.setSpacing(6)
-        row.addWidget(QLabel("IP 地址："))
+        group.setMinimumHeight(116)
+        grid = QGridLayout(group)
+        grid.setContentsMargins(9, 13, 9, 8)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(7)
+        grid.addWidget(QLabel("IP 地址："), 0, 0)
         self.ip_edit = QLineEdit("192.168.5.1")
         self.ip_edit.setFixedWidth(115)
-        row.addWidget(self.ip_edit)
-        row.addSpacing(7)
-        row.addWidget(QLabel("控制端口："))
+        grid.addWidget(self.ip_edit, 0, 1)
+        grid.addWidget(QLabel("控制端口："), 1, 0)
         self.dashboard_port_edit = QLineEdit("29999")
         self.dashboard_port_edit.setFixedWidth(62)
-        row.addWidget(self.dashboard_port_edit)
-        row.addSpacing(7)
-        row.addWidget(QLabel("反馈端口："))
+        grid.addWidget(self.dashboard_port_edit, 1, 1)
+        grid.addWidget(QLabel("反馈端口："), 1, 2)
         self.feedback_port_edit = QLineEdit("30004")
         self.feedback_port_edit.setFixedWidth(62)
-        row.addWidget(self.feedback_port_edit)
-        row.addStretch()
+        grid.addWidget(self.feedback_port_edit, 1, 3)
         self.connection_status_label = QLabel("●  未连接")
         self.connection_status_label.setObjectName("connectionBadge")
         self.connection_status_label.setProperty("connected", False)
         self.connection_status_label.setFixedHeight(30)
-        row.addWidget(self.connection_status_label)
+        grid.addWidget(self.connection_status_label, 0, 2, 1, 2)
         self.connect_button = QPushButton("连接")
         self.connect_button.setProperty("accent", True)
         self.connect_button.setFixedWidth(82)
         self.connect_button.clicked.connect(self.toggle_connection)
-        row.addWidget(self.connect_button)
+        grid.addWidget(self.connect_button, 0, 4, 2, 1)
+        grid.setColumnStretch(3, 1)
         return group
 
     def build_dashboard_group(self):
         group = QGroupBox("机器人控制")
         group.setObjectName("compactCard")
+        group.setMinimumHeight(116)
         grid = QGridLayout(group)
-        grid.setContentsMargins(9, 7, 9, 6)
+        grid.setContentsMargins(9, 13, 9, 8)
         grid.setHorizontalSpacing(6)
-        grid.setVerticalSpacing(5)
+        grid.setVerticalSpacing(7)
         self.enable_button = self.command_button("使能", self.toggle_enable)
         grid.addWidget(self.enable_button, 0, 0)
         grid.addWidget(self.command_button("清除错误", self.clear_error), 0, 2)
@@ -999,8 +1275,9 @@ class RobotUI(QMainWindow):
         return group
 
     def build_move_group(self):
-        group = QGroupBox("运动控制")
-        grid = QGridLayout(group)
+        page = QWidget()
+        grid = QGridLayout(page)
+        grid.setContentsMargins(10, 10, 10, 8)
         self.add_move_row(grid, 0, COORD_NAMES, ("600", "-260", "380", "170", "12", "140"))
         grid.addWidget(self.command_button("关节运动", self.move_pose_j), 0, 12)
         grid.addWidget(self.command_button("直线运动", self.move_pose_l), 0, 13)
@@ -1011,7 +1288,7 @@ class RobotUI(QMainWindow):
         grid.addWidget(self.stop_motion_button, 1, 13)
         grid.addWidget(self.build_pose_record_group(), 0, 14, 2, 1)
         grid.setColumnStretch(14, 1)
-        return group
+        return page
 
     def build_pose_record_group(self):
         group = QGroupBox("位姿记录与恢复")
@@ -1041,8 +1318,9 @@ class RobotUI(QMainWindow):
             grid.addWidget(edit, row, index * 2 + 1)
 
     def build_feedback_group(self):
-        group = QGroupBox("状态反馈")
-        outer = QVBoxLayout(group)
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(10, 10, 10, 8)
         status = QGridLayout()
         status.addWidget(QLabel("当前速度比例："), 0, 0)
         self.speed_feedback = QLabel()
@@ -1067,43 +1345,50 @@ class RobotUI(QMainWindow):
         status.setColumnStretch(5, 1)
         outer.addLayout(status)
 
-        middle = QHBoxLayout()
-        jog_widget = QWidget()
-        jog_grid = QGridLayout(jog_widget)
-        jog_grid.setContentsMargins(0, 0, 0, 0)
-        jog_grid.setHorizontalSpacing(5)
-        jog_grid.setVerticalSpacing(3)
-        self.add_jog_columns(jog_grid, 0, JOINT_NAMES)
-        jog_grid.setColumnMinimumWidth(4, 14)
-        self.add_jog_columns(jog_grid, 5, COORD_NAMES)
-        middle.addWidget(jog_widget, 4)
+        jog_row = QHBoxLayout()
+        jog_row.setContentsMargins(0, 0, 0, 0)
+        jog_row.setSpacing(8)
+        jog_row.addWidget(self.build_horizontal_jog_group("关节点动", JOINT_NAMES), 1)
+        jog_row.addWidget(self.build_horizontal_jog_group("Tool 坐标点动", COORD_NAMES), 1)
+        outer.addLayout(jog_row)
+        return page
 
-        error_group = QGroupBox("报警信息")
-        error_layout = QVBoxLayout(error_group)
-        self.error_text = QTextEdit()
-        self.error_text.setReadOnly(True)
-        error_layout.addWidget(self.error_text)
-        error_layout.addWidget(
-            self.command_button("清空", self.error_text.clear),
-            alignment=Qt.AlignmentFlag.AlignRight,
-        )
-        middle.addWidget(error_group, 2)
-        outer.addLayout(middle, 1)
-        return group
+    def build_horizontal_jog_group(self, title, names):
+        group = QGroupBox(title)
+        layout = QHBoxLayout(group)
+        layout.setContentsMargins(7, 6, 7, 5)
+        layout.setSpacing(5)
+        for name in names:
+            axis_widget = QWidget()
+            axis_layout = QVBoxLayout(axis_widget)
+            axis_layout.setContentsMargins(0, 0, 0, 0)
+            axis_layout.setSpacing(3)
 
-    def add_jog_columns(self, grid, start_column, names):
-        for row, name in enumerate(names):
-            minus = self.jog_button(f"{name}-")
-            plus = self.jog_button(f"{name}+")
             value = QLabel(" ")
             value.setProperty("value", True)
-            value.setMinimumWidth(54)
-            value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            value.setMinimumWidth(48)
+            value.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.feedback_labels[f"{name}:"] = value
-            grid.addWidget(minus, row, start_column)
-            grid.addWidget(QLabel(f"{name}:"), row, start_column + 1)
-            grid.addWidget(value, row, start_column + 2)
-            grid.addWidget(plus, row, start_column + 3)
+
+            title_row = QHBoxLayout()
+            title_row.setContentsMargins(0, 0, 0, 0)
+            title_row.setSpacing(3)
+            name_label = QLabel(f"{name}:")
+            name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            title_row.addWidget(name_label)
+            title_row.addWidget(value, 1)
+            axis_layout.addLayout(title_row)
+
+            minus = self.jog_button(f"{name}-")
+            plus = self.jog_button(f"{name}+")
+            button_row = QHBoxLayout()
+            button_row.setContentsMargins(0, 0, 0, 0)
+            button_row.setSpacing(3)
+            button_row.addWidget(minus)
+            button_row.addWidget(plus)
+            axis_layout.addLayout(button_row)
+            layout.addWidget(axis_widget, 1)
+        return group
 
     def build_log_group(self):
         group = QGroupBox("运行日志")
@@ -1114,22 +1399,39 @@ class RobotUI(QMainWindow):
         layout.addWidget(self.log_text)
         return group
 
+    def build_alarm_group(self):
+        group = QGroupBox("报警信息")
+        layout = QVBoxLayout(group)
+        self.error_text = QTextEdit()
+        self.error_text.setReadOnly(True)
+        layout.addWidget(self.error_text)
+        layout.addWidget(
+            self.command_button("清空", self.error_text.clear),
+            alignment=Qt.AlignmentFlag.AlignRight,
+        )
+        return group
+
     def build_imu_calibration_group(self):
         group = QGroupBox("IMU 校准")
         layout = QVBoxLayout(group)
         layout.setContentsMargins(8, 8, 8, 8)
 
         self.imu_tabs = QTabWidget()
-        self.imu_tabs.setDocumentMode(True)
+        self.imu_tabs.setObjectName("cardTabs")
+        self.imu_tabs.setDocumentMode(False)
+        self.imu_tabs.tabBar().setDrawBase(False)
         self.imu_tabs.setTabPosition(QTabWidget.TabPosition.North)
 
         dynamic_page = QWidget()
-        dynamic_layout = QHBoxLayout(dynamic_page)
+        dynamic_layout = QVBoxLayout(dynamic_page)
         dynamic_layout.setContentsMargins(8, 8, 8, 8)
         dynamic_layout.setSpacing(10)
 
+        top_controls = QHBoxLayout()
+        top_controls.setSpacing(10)
+
         controls = QWidget()
-        controls.setFixedWidth(420)
+        controls.setMinimumWidth(620)
         controls_layout = QVBoxLayout(controls)
         controls_layout.setContentsMargins(0, 0, 4, 0)
         controls_layout.setSpacing(6)
@@ -1170,7 +1472,7 @@ class RobotUI(QMainWindow):
         rotation_grid = QGridLayout(rotation_group)
         rotation_grid.setContentsMargins(8, 8, 8, 6)
         rotation_grid.setHorizontalSpacing(6)
-        rotation_grid.setVerticalSpacing(5)
+        rotation_grid.setVerticalSpacing(7)
         rotation_grid.addWidget(QLabel("旋转轴："), 0, 0)
         self.rotation_axis_combo = QComboBox()
         self.rotation_axis_combo.addItems(("Rx", "Ry", "Rz"))
@@ -1192,7 +1494,77 @@ class RobotUI(QMainWindow):
         self.rotation_status_label = QLabel("等待连接")
         self.rotation_status_label.setProperty("value", True)
         rotation_grid.addWidget(self.rotation_status_label, 1, 2, 1, 4)
-        controls_layout.addWidget(rotation_group)
+
+        combined_widget = QWidget()
+        combined_row = QHBoxLayout(combined_widget)
+        combined_row.setContentsMargins(0, 0, 0, 0)
+        combined_row.setSpacing(6)
+        combined_row.addWidget(QLabel("组合角速度："))
+        self.combined_speed_edits = {}
+        for name in ("Rx", "Ry", "Rz"):
+            combined_row.addWidget(QLabel(f"{name}："))
+            edit = QLineEdit("0")
+            edit.setFixedWidth(52)
+            edit.setToolTip("组合旋转角速度，单位：°/s")
+            self.combined_speed_edits[name] = edit
+            combined_row.addWidget(edit)
+        combined_row.addWidget(QLabel("项间 CP："))
+        self.rotation_cp_edit = QLineEdit("100")
+        self.rotation_cp_edit.setFixedWidth(42)
+        self.rotation_cp_edit.setToolTip(
+            "运动列表中相邻点的平滑过渡比例：0 为不平滑，100 为最大平滑"
+        )
+        combined_row.addWidget(self.rotation_cp_edit)
+        combined_row.addWidget(QLabel("过渡："))
+        self.rotation_transition_time_edit = QLineEdit("0.8")
+        self.rotation_transition_time_edit.setFixedWidth(38)
+        self.rotation_transition_time_edit.setToolTip("相邻运动项自动插值过渡总时长（秒）")
+        combined_row.addWidget(self.rotation_transition_time_edit)
+        combined_row.addWidget(QLabel("s / 段："))
+        self.rotation_transition_steps_edit = QLineEdit("6")
+        self.rotation_transition_steps_edit.setFixedWidth(30)
+        self.rotation_transition_steps_edit.setToolTip("每个相邻运动项之间自动生成的插值段数（2～20）")
+        combined_row.addWidget(self.rotation_transition_steps_edit)
+        combined_row.addStretch()
+        rotation_grid.addWidget(combined_widget, 2, 0, 1, 6)
+
+        self.add_combined_rotation_item_button = self.command_button(
+            "添加组合项", self.add_combined_rotation_plan_item
+        )
+        self.add_rotation_item_button = self.command_button(
+            "添加运动项", self.add_rotation_plan_item
+        )
+        self.remove_rotation_item_button = self.command_button(
+            "删除选中", self.remove_selected_rotation_plan_item
+        )
+        self.clear_rotation_items_button = self.command_button(
+            "清空列表", self.clear_rotation_plan_items
+        )
+        plan_button_widget = QWidget()
+        plan_button_row = QHBoxLayout(plan_button_widget)
+        plan_button_row.setContentsMargins(0, 0, 0, 0)
+        plan_button_row.setSpacing(6)
+        for button in (
+            self.add_rotation_item_button,
+            self.add_combined_rotation_item_button,
+            self.remove_rotation_item_button,
+            self.clear_rotation_items_button,
+        ):
+            plan_button_row.addWidget(button, 1)
+        rotation_grid.addWidget(plan_button_widget, 3, 0, 1, 6)
+
+        self.rotation_plan_list = QListWidget()
+        self.rotation_plan_list.setMinimumHeight(150)
+        self.rotation_plan_list.setStyleSheet("QListWidget::item { min-height: 24px; }")
+        self.rotation_plan_list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self.rotation_plan_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.rotation_plan_list.setToolTip(
+            "按添加顺序依次运行；每一项完成后，下一项会从机械臂当前反馈姿态开始"
+        )
+        rotation_grid.addWidget(self.rotation_plan_list, 4, 0, 1, 6)
+        rotation_grid.setRowStretch(4, 1)
+        for column in range(6):
+            rotation_grid.setColumnStretch(column, 1)
 
         capture_row = QHBoxLayout()
         capture_row.addWidget(QLabel("角速度曲线："))
@@ -1205,8 +1577,6 @@ class RobotUI(QMainWindow):
         capture_row.addWidget(self.imu_status_label)
         capture_row.addStretch()
         controls_layout.addLayout(capture_row)
-        dynamic_layout.addWidget(controls)
-
         chart = QChart()
         chart.setTitle("机械臂末端在 Tool 坐标系下的旋转速度")
         chart.setTitleFont(QFont("Microsoft YaHei UI", 11, QFont.Weight.DemiBold))
@@ -1251,8 +1621,13 @@ class RobotUI(QMainWindow):
         chart_view = QChartView(chart)
         chart_view.setStyleSheet("background: transparent; border: none;")
         chart_view.setRenderHint(QPainter.RenderHint.Antialiasing)
-        chart_view.setMinimumHeight(330)
-        dynamic_layout.addWidget(chart_view, 1)
+        chart_view.setMinimumHeight(260)
+        controls_layout.addWidget(chart_view, 1)
+
+        rotation_group.setMinimumWidth(430)
+        top_controls.addWidget(controls, 2)
+        top_controls.addWidget(rotation_group, 1)
+        dynamic_layout.addLayout(top_controls, 1)
 
         static_page = self.build_static_imu_calibration_page()
         self.imu_tabs.addTab(dynamic_page, "动态校准")
@@ -1336,6 +1711,14 @@ class RobotUI(QMainWindow):
     def set_controls_enabled(self, enabled):
         for button in self.command_buttons:
             button.setEnabled(enabled)
+        for name in (
+            "add_combined_rotation_item_button",
+            "add_rotation_item_button",
+            "remove_rotation_item_button",
+            "clear_rotation_items_button",
+        ):
+            if hasattr(self, name):
+                getattr(self, name).setEnabled(True)
         if hasattr(self, "restore_pose_button"):
             self.restore_pose_button.setEnabled(enabled and self.recorded_pose is not None)
 
@@ -1603,6 +1986,7 @@ class RobotUI(QMainWindow):
         self.static_status_label.setText("等待记录静态样本")
         self.tool_status_label.setText("当前使用 Tool 0（法兰坐标系）")
         self.append_log(f"已连接机器人：{ip}")
+        self.apply_saved_tool_offset_to_robot()
 
     def disconnect_robot(self):
         self.shutdown_rotation()
@@ -1735,8 +2119,13 @@ class RobotUI(QMainWindow):
         if command.startswith("J"):
             result = self.run_command("关节点动", lambda: self.client_dash.MoveJog(command))
         else:
+            tool_index = int(self.latest_tool_index)
+            user_index = int(self.latest_user_index)
             result = self.run_command(
-                "坐标点动", lambda: self.client_dash.MoveJog(command, coordtype=1, user=0, tool=0)
+                f"Tool 坐标点动 Tool {tool_index}",
+                lambda: self.client_dash.MoveJog(
+                    command, coordtype=2, user=user_index, tool=tool_index
+                ),
             )
         if self.result_error_id(result) not in (0, None):
             self.active_jog_command = None
@@ -1776,6 +2165,101 @@ class RobotUI(QMainWindow):
         match = re.match(r"\s*(-?\d+)", str(result)) if result is not None else None
         return int(match.group(1)) if match else None
 
+    @staticmethod
+    def validate_tool_offset_config(data):
+        tool_index = int(data["tool"])
+        active_tool = int(data.get("active_tool", tool_index))
+        values = [float(value) for value in data["offset"]]
+        if not 1 <= tool_index <= 9:
+            raise ValueError("Tool 编号必须在 1～9 之间")
+        if active_tool != 0 and active_tool != tool_index:
+            raise ValueError("active_tool 必须为 0 或保存的 Tool 编号")
+        if len(values) != 6 or not all(math.isfinite(value) for value in values):
+            raise ValueError("工具坐标系偏移必须包含 6 个有效数值")
+        if any(abs(value) > 1000 for value in values[:3]):
+            raise ValueError("XYZ 偏移范围必须在 -1000～1000 mm 之间")
+        if any(abs(value) > 180 for value in values[3:]):
+            raise ValueError("Rx/Ry/Rz 偏移范围必须在 -180～180° 之间")
+        return {
+            "tool": tool_index,
+            "active_tool": active_tool,
+            "offset": values,
+            "saved_at": str(data.get("saved_at", "")),
+        }
+
+    def load_tool_offset_config(self):
+        if not TOOL_OFFSET_FILE.exists():
+            return
+        try:
+            data = json.loads(TOOL_OFFSET_FILE.read_text(encoding="utf-8"))
+            config = self.validate_tool_offset_config(data)
+        except Exception as exc:
+            self.append_log(f"工具坐标系配置读取失败，已忽略：{exc}")
+            return
+        self.saved_tool_offset = config
+        self.tool_index_combo.setCurrentText(str(config["tool"]))
+        for name, value in zip(COORD_NAMES, config["offset"]):
+            self.tool_offset_edits[name].setText(f"{value:g}")
+        if config["active_tool"] == 0:
+            self.active_tool_index = 0
+            self.tool_status_label.setText(
+                f"已载入 Tool {config['tool']} 偏移；当前默认 Tool 0"
+            )
+        else:
+            self.active_tool_index = config["tool"]
+            self.tool_status_label.setText(
+                f"已载入 Tool {config['tool']} 偏移，连接后自动启用"
+            )
+        self.append_log(
+            f"已载入工具坐标系配置：Tool {config['tool']}，"
+            f"active={config['active_tool']}"
+        )
+
+    def save_tool_offset_config(self, tool_index, values, active_tool):
+        data = {
+            "version": 1,
+            "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "tool": int(tool_index),
+            "active_tool": int(active_tool),
+            "offset": [float(value) for value in values],
+            "units": {
+                "X": "mm", "Y": "mm", "Z": "mm",
+                "Rx": "deg", "Ry": "deg", "Rz": "deg",
+            },
+        }
+        temporary = TOOL_OFFSET_FILE.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        temporary.replace(TOOL_OFFSET_FILE)
+        self.saved_tool_offset = self.validate_tool_offset_config(data)
+
+    def apply_saved_tool_offset_to_robot(self):
+        config = self.saved_tool_offset
+        if not config or config["active_tool"] == 0:
+            return
+        tool_index = int(config["tool"])
+        values = config["offset"]
+        table = "{" + ",".join(f"{value:.6f}" for value in values) + "}"
+        result = self.run_command(
+            f"恢复上次 Tool {tool_index} 坐标系",
+            lambda: self.client_dash.SetTool(tool_index, table),
+        )
+        if self.result_error_id(result) != 0:
+            self.tool_status_label.setText(f"Tool {tool_index} 自动恢复失败")
+            self.append_log(f"Tool {tool_index} 自动恢复失败：{result}")
+            return
+        result = self.run_command(
+            f"启用上次 Tool {tool_index}", lambda: self.client_dash.Tool(tool_index)
+        )
+        if self.result_error_id(result) != 0:
+            self.tool_status_label.setText(f"Tool {tool_index} 自动启用失败")
+            self.append_log(f"Tool {tool_index} 自动启用失败：{result}")
+            return
+        self.active_tool_index = tool_index
+        self.latest_tool_index = tool_index
+        self.tool_status_label.setText(f"Tool {tool_index} 已从上次配置恢复并启用")
+
     def apply_tool_offset(self):
         try:
             tool_index = int(self.tool_index_combo.currentText())
@@ -1803,6 +2287,13 @@ class RobotUI(QMainWindow):
             QMessageBox.warning(self, "设置失败", f"工具坐标系启用失败：\n{result}")
             return
         self.active_tool_index = tool_index
+        self.latest_tool_index = tool_index
+        try:
+            self.save_tool_offset_config(tool_index, values, tool_index)
+        except Exception as exc:
+            QMessageBox.warning(self, "本地保存失败", f"Tool 已启用，但本地配置保存失败：\n{exc}")
+            self.append_log(f"工具坐标系本地配置保存失败：{exc}")
+            return
         self.tool_status_label.setText(f"Tool {tool_index} 已保存并启用")
 
     def restore_tool_zero(self):
@@ -1811,6 +2302,16 @@ class RobotUI(QMainWindow):
             QMessageBox.warning(self, "设置失败", f"Tool 0 启用失败：\n{result}")
             return
         self.active_tool_index = 0
+        self.latest_tool_index = 0
+        if self.saved_tool_offset:
+            try:
+                self.save_tool_offset_config(
+                    self.saved_tool_offset["tool"],
+                    self.saved_tool_offset["offset"],
+                    0,
+                )
+            except Exception as exc:
+                self.append_log(f"Tool 0 状态本地保存失败：{exc}")
         self.tool_status_label.setText("当前使用 Tool 0（法兰坐标系）")
 
     def load_recorded_pose(self):
@@ -1944,8 +2445,109 @@ class RobotUI(QMainWindow):
             return
         self.recorded_pose_label.setText("恢复指令已发送（速度比例 50%）")
 
+    def rotation_item_from_inputs(self, allow_manual_stop):
+        angular_speed = float(self.angular_speed_edit.text())
+        duration = float(self.rotation_duration_edit.text())
+        if not 0.1 <= abs(angular_speed) <= 60.0:
+            raise ValueError("角速度绝对值必须在 0.1～60 °/s 之间")
+        if allow_manual_stop:
+            if not 0.0 <= duration <= 60.0:
+                raise ValueError("持续时间必须在 0～60 秒之间；0 表示手动停止")
+        elif not 0.1 <= duration <= 60.0:
+            raise ValueError("运动项持续时间必须在 0.1～60 秒之间")
+        return {
+            "axis": self.rotation_axis_combo.currentText(),
+            "angular_speed": angular_speed,
+            "duration": duration,
+        }
+
+    @staticmethod
+    def format_rotation_plan_item(item, index=None):
+        prefix = "" if index is None else f"{index}. "
+        if item.get("type") == "vector":
+            speeds = item["angular_speed_vector"]
+            speed_norm = math.sqrt(sum(value * value for value in speeds))
+            total_angle = speed_norm * item["duration"]
+            return (
+                f"{prefix}组合  "
+                f"Rx={speeds[0]:+.2f}, Ry={speeds[1]:+.2f}, Rz={speeds[2]:+.2f} °/s  "
+                f"{item['duration']:.2f} s  合速度 {speed_norm:.2f} °/s  "
+                f"等效角度 {total_angle:.2f}°"
+            )
+        total_angle = abs(item["angular_speed"]) * item["duration"]
+        return (
+            f"{prefix}{item['axis']}  "
+            f"{item['angular_speed']:+.2f} °/s  "
+            f"{item['duration']:.2f} s  "
+            f"总角度 {total_angle:.2f}°"
+        )
+
+    def refresh_rotation_plan_list(self):
+        selected = self.rotation_plan_list.currentRow()
+        self.rotation_plan_list.clear()
+        for index, item in enumerate(self.rotation_plan_items, 1):
+            text = self.format_rotation_plan_item(item, index)
+            self.rotation_plan_list.addItem(text)
+        if self.rotation_plan_items:
+            selected = min(max(selected, 0), len(self.rotation_plan_items) - 1)
+            self.rotation_plan_list.setCurrentRow(selected)
+
+    def add_rotation_plan_item(self):
+        try:
+            item = self.rotation_item_from_inputs(allow_manual_stop=False)
+        except ValueError as exc:
+            QMessageBox.warning(self, "输入错误", str(exc))
+            return
+        self.rotation_plan_items.append(item)
+        self.refresh_rotation_plan_list()
+        self.rotation_status_label.setText(f"已添加 {len(self.rotation_plan_items)} 个运动项")
+        self.append_log(f"已添加 IMU 运动项：{self.format_rotation_plan_item(item)}")
+
+    def add_combined_rotation_plan_item(self):
+        try:
+            speeds = [
+                float(self.combined_speed_edits[name].text())
+                for name in ("Rx", "Ry", "Rz")
+            ]
+            duration = float(self.rotation_duration_edit.text())
+            speed_norm = math.sqrt(sum(value * value for value in speeds))
+            if not 0.1 <= speed_norm <= 60.0:
+                raise ValueError("组合角速度合速度必须在 0.1～60 °/s 之间")
+            if not 0.1 <= duration <= 60.0:
+                raise ValueError("组合运动项持续时间必须在 0.1～60 秒之间")
+            if any(abs(value) > 60.0 for value in speeds):
+                raise ValueError("单轴角速度绝对值不能超过 60 °/s")
+        except ValueError as exc:
+            QMessageBox.warning(self, "输入错误", str(exc))
+            return
+        item = {
+            "type": "vector",
+            "axis": "组合",
+            "angular_speed_vector": speeds,
+            "duration": duration,
+        }
+        self.rotation_plan_items.append(item)
+        self.refresh_rotation_plan_list()
+        self.rotation_status_label.setText(f"已添加 {len(self.rotation_plan_items)} 个运动项")
+        self.append_log(f"已添加 IMU 组合运动项：{self.format_rotation_plan_item(item)}")
+
+    def remove_selected_rotation_plan_item(self):
+        row = self.rotation_plan_list.currentRow()
+        if row < 0 or row >= len(self.rotation_plan_items):
+            QMessageBox.information(self, "未选择", "请先在运动项列表中选择一项")
+            return
+        removed = self.rotation_plan_items.pop(row)
+        self.refresh_rotation_plan_list()
+        self.append_log(f"已删除 IMU 运动项：{self.format_rotation_plan_item(removed)}")
+
+    def clear_rotation_plan_items(self):
+        self.rotation_plan_items.clear()
+        self.refresh_rotation_plan_list()
+        self.rotation_status_label.setText("运动项列表已清空")
+        self.append_log("已清空 IMU 运动项列表")
+
     def toggle_continuous_rotation(self):
-        if self.rotation_running:
+        if self.rotation_running or self.rotation_sequence_items:
             self.stop_continuous_rotation()
         else:
             self.start_continuous_rotation()
@@ -1964,12 +2566,10 @@ class RobotUI(QMainWindow):
             )
             return
         try:
-            angular_speed = float(self.angular_speed_edit.text())
-            duration = float(self.rotation_duration_edit.text())
-            if not 0.1 <= abs(angular_speed) <= 60.0:
-                raise ValueError("角速度绝对值必须在 0.1～60 °/s 之间")
-            if not 0.0 <= duration <= 60.0:
-                raise ValueError("持续时间必须在 0～60 秒之间；0 表示手动停止")
+            if self.rotation_plan_items:
+                items = [dict(item) for item in self.rotation_plan_items]
+            else:
+                items = [self.rotation_item_from_inputs(allow_manual_stop=True)]
         except ValueError as exc:
             QMessageBox.warning(self, "输入错误", str(exc))
             return
@@ -1977,7 +2577,209 @@ class RobotUI(QMainWindow):
         if not self.calibration_running:
             self.toggle_imu_calibration()
 
-        axis = self.rotation_axis_combo.currentText()
+        self.rotation_sequence_items = items
+        self.rotation_sequence_index = 0
+        self.rotation_sequence_stopping = False
+        self.rotation_sequence_blended = False
+        if (
+            all(item["duration"] > 0 for item in items)
+            and (len(items) > 1 or any(item.get("type") == "vector" for item in items))
+        ):
+            self.start_blended_rotation_sequence(items)
+        else:
+            self.start_rotation_sequence_item()
+
+    def start_blended_rotation_sequence(self, items):
+        try:
+            cp = int(self.rotation_cp_edit.text())
+            if not 0 <= cp <= 100:
+                raise ValueError
+            transition_total = float(self.rotation_transition_time_edit.text())
+            transition_steps = int(self.rotation_transition_steps_edit.text())
+            if not 0.05 <= transition_total <= 3.0 or not 2 <= transition_steps <= 20:
+                raise ValueError
+        except ValueError:
+            QMessageBox.warning(self, "输入错误", "CP 为 0～100；过渡时间为 0.05～3 秒；段数为 2～20")
+            return
+
+        # Convert every item to an Rx/Ry/Rz speed vector.  At each genuine
+        # direction/speed change, insert a short average-speed item and remove
+        # half of that time from either neighbour.  This preserves the total
+        # angular displacement while replacing an instantaneous velocity change
+        # by a physically smoother transition.
+        def speed_vector(item):
+            if item.get("type") == "vector":
+                return [float(value) for value in item["angular_speed_vector"]]
+            values = [0.0, 0.0, 0.0]
+            values[("Rx", "Ry", "Rz").index(item["axis"])] = float(item["angular_speed"])
+            return values
+
+        source_items = [dict(item) for item in items]
+        transition_after = [None] * max(0, len(source_items) - 1)
+        duration_reduction = [0.0] * len(source_items)
+        transition_count = 0
+        for index in range(len(source_items) - 1):
+            previous = source_items[index]
+            following = source_items[index + 1]
+            previous_speed = speed_vector(previous)
+            following_speed = speed_vector(following)
+            if max(abs(a - b) for a, b in zip(previous_speed, following_speed)) < 1e-6:
+                continue
+            transition_duration = min(transition_total, float(previous["duration"]) * 0.4, float(following["duration"]) * 0.4)
+            if transition_duration <= 0.0:
+                continue
+            duration_reduction[index] += transition_duration / 2
+            duration_reduction[index + 1] += transition_duration / 2
+            transition_after[index] = [
+                {
+                    "type": "vector", "axis": "自动过渡",
+                    "angular_speed_vector": [a + (b - a) * step / transition_steps for a, b in zip(previous_speed, following_speed)],
+                    "duration": transition_duration / transition_steps,
+                    "auto_transition": True,
+                }
+                for step in range(1, transition_steps + 1)
+            ]
+            transition_count += transition_steps
+
+        smoothed_items = []
+        for index, item in enumerate(source_items):
+            item["duration"] = float(item["duration"]) - duration_reduction[index]
+            smoothed_items.append(item)
+            if index < len(transition_after) and transition_after[index] is not None:
+                smoothed_items.extend(transition_after[index])
+
+        planned_items = []
+        try:
+            for item in smoothed_items:
+                if item.get("type") == "vector":
+                    values = []
+                    calibrated_flags = []
+                    global_scales = []
+                    for axis, speed in zip(
+                        ("Rx", "Ry", "Rz"), item["angular_speed_vector"]
+                    ):
+                        if abs(speed) < 1e-9:
+                            continue
+                        axis_v, axis_global_scale, axis_calibrated = (
+                            self.controller_v_for_rotation(
+                                axis, speed, self.latest_tool_index
+                            )
+                        )
+                        values.append(axis_v)
+                        global_scales.append(axis_global_scale)
+                        calibrated_flags.append(axis_calibrated)
+                    controller_v = max(values) if values else 1
+                    global_scale = global_scales[0] if global_scales else 1.0
+                    calibrated = all(calibrated_flags) if calibrated_flags else False
+                else:
+                    controller_v, global_scale, calibrated = self.controller_v_for_rotation(
+                        item["axis"], item["angular_speed"], self.latest_tool_index
+                    )
+                planned = dict(item)
+                planned.update({
+                    "controller_v": controller_v,
+                    "global_speed_scale": global_scale,
+                    "calibrated": calibrated,
+                })
+                planned_items.append(planned)
+        except Exception as exc:
+            QMessageBox.critical(self, "序列准备失败", f"无法准备 IMU 运动序列：\n{exc}")
+            self.rotation_sequence_items = []
+            self.rotation_sequence_stopping = False
+            self.rotation_sequence_blended = False
+            self.restore_rotation_controls()
+            return
+
+        self.rotation_sequence_items = planned_items
+        self.rotation_sequence_index = 0
+        self.rotation_sequence_blended = True
+        self.rotation_diagnostics = None
+        self.rotation_diagnostics = RotationSequenceDiagnostics()
+        self.active_rotation_axis = planned_items[0]["axis"]
+        self.rotation_thread = RotationPlanThread(
+            self.client_dash,
+            planned_items,
+            lambda: self.latest_robot_mode,
+            cp=cp,
+            diagnostics=self.rotation_diagnostics,
+            parent=self,
+        )
+        self.rotation_thread.progress.connect(self.on_rotation_progress)
+        self.rotation_thread.rotation_done.connect(self.on_rotation_done)
+        self.rotation_thread.rotation_error.connect(self.on_rotation_error)
+        self.rotation_running = True
+        self.rotation_button.setText("停止旋转")
+        self.rotation_status_label.setText(f"连续序列：第 1/{len(planned_items)} 项")
+        for button in self.command_buttons:
+            button.setEnabled(button in (self.rotation_button, self.stop_motion_button))
+        self.rotation_axis_combo.setEnabled(False)
+        self.angular_speed_edit.setEnabled(False)
+        self.rotation_duration_edit.setEnabled(False)
+        for edit in self.combined_speed_edits.values():
+            edit.setEnabled(False)
+        self.rotation_cp_edit.setEnabled(False)
+        self.rotation_transition_time_edit.setEnabled(False)
+        self.rotation_transition_steps_edit.setEnabled(False)
+        self.rotation_plan_list.setEnabled(False)
+        self.rotation_plan_list.setCurrentRow(0)
+        self.append_log(
+            f"开始 IMU 连续运动序列：共 {len(planned_items)} 项，"
+            f"使用 RelMovLTool 提前排队，项间 cp={cp} 平滑衔接；"
+            f"已自动插入 {transition_count} 个速度过渡段（目标 {transition_total:.2f} s / 衔接）"
+        )
+        for index, item in enumerate(planned_items, 1):
+            if item.get("type") == "vector":
+                speeds = item["angular_speed_vector"]
+                speed_norm = math.sqrt(sum(value * value for value in speeds))
+                self.append_log(
+                    f"序列第 {index} 项：Tool {self.latest_tool_index} 组合旋转，"
+                    f"Rx={speeds[0]:+.2f}, Ry={speeds[1]:+.2f}, Rz={speeds[2]:+.2f} °/s，"
+                    f"持续时间={item['duration']:g} s，合速度={speed_norm:.2f} °/s，"
+                    f"v={item['controller_v']}%"
+                )
+            else:
+                total_angle = abs(item["angular_speed"]) * item["duration"]
+                self.append_log(
+                    f"序列第 {index} 项：Tool {self.latest_tool_index} {item['axis']}，"
+                    f"目标角速度={item['angular_speed']:+.2f} °/s，"
+                    f"持续时间={item['duration']:g} s，总角度={total_angle:.2f}°，"
+                    f"v={item['controller_v']}%"
+                )
+        self.append_log("连续序列模式下不按单项生成诊断 CSV；右侧曲线仍显示实时反馈角速度")
+        self.rotation_thread.start()
+
+    def start_rotation_sequence_item(self, retry_count=0):
+        if self.rotation_sequence_stopping or not self.rotation_sequence_items:
+            return
+        if not self.connected or self.client_dash is None:
+            self.rotation_sequence_items = []
+            return
+        if self.latest_pose is None:
+            QMessageBox.warning(self, "暂无反馈", "尚未收到机械臂实时位姿，请稍后再试")
+            self.rotation_sequence_items = []
+            return
+        if self.latest_robot_mode != 5:
+            if retry_count < 15:
+                self.rotation_status_label.setText("等待机械臂空闲...")
+                QTimer.singleShot(
+                    200,
+                    lambda: self.start_rotation_sequence_item(retry_count + 1),
+                )
+                return
+            mode_text = ROBOT_MODES.get(self.latest_robot_mode, str(self.latest_robot_mode))
+            QMessageBox.warning(
+                self,
+                "机器人未就绪",
+                f"下一项旋转要求机器人处于已使能且空闲状态。\n当前状态：{mode_text}",
+            )
+            self.rotation_sequence_items = []
+            self.restore_rotation_controls()
+            return
+
+        item = self.rotation_sequence_items[self.rotation_sequence_index]
+        axis = item["axis"]
+        angular_speed = float(item["angular_speed"])
+        duration = float(item["duration"])
         self.active_rotation_axis = axis
         total_angle = abs(angular_speed) * duration if duration > 0 else math.inf
         use_jog = duration == 0 or total_angle > 170.0
@@ -2008,6 +2810,9 @@ class RobotUI(QMainWindow):
             )
         except Exception as exc:
             QMessageBox.critical(self, "旋转准备失败", f"无法准备 IMU 旋转：\n{exc}")
+            self.rotation_sequence_items = []
+            self.rotation_sequence_stopping = False
+            self.restore_rotation_controls()
             return
         if use_jog:
             self.rotation_thread = JogRotationThread(
@@ -2038,16 +2843,29 @@ class RobotUI(QMainWindow):
         self.rotation_thread.rotation_error.connect(self.on_rotation_error)
         self.rotation_running = True
         self.rotation_button.setText("停止旋转")
+        total_items = len(self.rotation_sequence_items)
+        item_text = (
+            f"第 {self.rotation_sequence_index + 1}/{total_items} 项 "
+            if total_items > 1 else ""
+        )
         self.rotation_status_label.setText(
-            f"{axis}：{angular_speed:+.2f} °/s"
+            f"{item_text}{axis}：{angular_speed:+.2f} °/s"
         )
         for button in self.command_buttons:
             button.setEnabled(button in (self.rotation_button, self.stop_motion_button))
         self.rotation_axis_combo.setEnabled(False)
         self.angular_speed_edit.setEnabled(False)
         self.rotation_duration_edit.setEnabled(False)
+        for edit in self.combined_speed_edits.values():
+            edit.setEnabled(False)
+        self.rotation_cp_edit.setEnabled(False)
+        self.rotation_transition_time_edit.setEnabled(False)
+        self.rotation_transition_steps_edit.setEnabled(False)
+        self.rotation_plan_list.setEnabled(False)
+        if total_items > 1:
+            self.rotation_plan_list.setCurrentRow(self.rotation_sequence_index)
         self.append_log(
-            f"开始 IMU Tool 轴旋转：Tool {self.latest_tool_index} {axis}，"
+            f"开始 IMU Tool 轴旋转：{item_text}Tool {self.latest_tool_index} {axis}，"
             f"目标角速度={angular_speed:+.2f} °/s，持续时间={duration:g} s"
         )
         if use_jog:
@@ -2071,16 +2889,46 @@ class RobotUI(QMainWindow):
         self.rotation_status_label.setToolTip(str(self.rotation_diagnostics.path))
         self.rotation_thread.start()
 
+    def restore_rotation_controls(self):
+        self.rotation_button.setEnabled(True)
+        self.rotation_button.setText("开始旋转")
+        if self.connected:
+            self.set_controls_enabled(True)
+        self.rotation_axis_combo.setEnabled(True)
+        self.angular_speed_edit.setEnabled(True)
+        self.rotation_duration_edit.setEnabled(True)
+        for edit in self.combined_speed_edits.values():
+            edit.setEnabled(True)
+        self.rotation_cp_edit.setEnabled(True)
+        self.rotation_transition_time_edit.setEnabled(True)
+        self.rotation_transition_steps_edit.setEnabled(True)
+        self.rotation_plan_list.setEnabled(True)
+
     def stop_continuous_rotation(self):
-        if self.rotation_thread is not None and self.rotation_thread.isRunning():
+        self.rotation_sequence_stopping = True
+        self.rotation_sequence_items = []
+        thread_running = (
+            self.rotation_thread is not None and self.rotation_thread.isRunning()
+        )
+        if thread_running:
             self.rotation_thread.stop()
         self.rotation_button.setEnabled(False)
         self.rotation_status_label.setText("正在停止...")
+        if not thread_running:
+            self.rotation_running = False
+            self.rotation_sequence_stopping = False
+            self.rotation_sequence_blended = False
+            self.restore_rotation_controls()
+            self.rotation_status_label.setText("已停止")
+            return
         if isinstance(self.rotation_thread, JogRotationThread):
             return
         self.run_command("停止连续旋转", self.client_dash.Stop)
 
     def shutdown_rotation(self):
+        self.rotation_sequence_stopping = True
+        self.rotation_sequence_items = []
+        self.rotation_sequence_blended = False
         if self.rotation_thread is None or not self.rotation_thread.isRunning():
             self.rotation_running = False
             self.finish_rotation_diagnostics("连接关闭")
@@ -2108,6 +2956,19 @@ class RobotUI(QMainWindow):
         if not summary:
             return
 
+        if isinstance(diagnostics, RotationSequenceDiagnostics):
+            actual = summary["actual_angular_speed_norm_deg_s"]
+            self.append_log(f"多点平滑诊断 CSV 已保存：{diagnostics.path}")
+            self.append_log(f"多点平滑诊断摘要已保存：{diagnostics.summary_path}")
+            self.append_log(
+                f"反馈帧={summary['feedback_count']}；实际角速度合速度均值="
+                f"{actual['mean'] if actual['mean'] is not None else '无'} °/s"
+            )
+            self.rotation_status_label.setToolTip(
+                f"CSV：{diagnostics.path}\n摘要：{diagnostics.summary_path}"
+            )
+            return
+
         feedback = summary["feedback"]
         plateau = summary.get("plateau_feedback", {})
         displayed_feedback = plateau if plateau.get("count", 0) else feedback
@@ -2133,32 +2994,71 @@ class RobotUI(QMainWindow):
         )
 
     def on_rotation_progress(self, angle):
+        if isinstance(angle, dict):
+            item_index = int(angle.get("item_index", self.rotation_sequence_index))
+            self.rotation_sequence_index = item_index
+            axis = angle.get("axis", self.active_rotation_axis or self.rotation_axis_combo.currentText())
+            value = float(angle.get("angle", 0.0))
+            total_items = len(self.rotation_sequence_items)
+            if total_items > 1:
+                self.rotation_plan_list.blockSignals(True)
+                self.rotation_plan_list.setCurrentRow(item_index)
+                self.rotation_plan_list.blockSignals(False)
+                self.rotation_status_label.setText(
+                    f"第 {item_index + 1}/{total_items} 项 旋转中：{axis} {value:+.2f}°"
+                )
+            else:
+                self.rotation_status_label.setText(f"旋转中：{axis} {value:+.2f}°")
+            return
         axis = self.active_rotation_axis or self.rotation_axis_combo.currentText()
-        self.rotation_status_label.setText(f"旋转中：{axis} {angle:+.2f}°")
+        total_items = len(self.rotation_sequence_items)
+        item_text = (
+            f"第 {self.rotation_sequence_index + 1}/{total_items} 项 "
+            if total_items > 1 else ""
+        )
+        self.rotation_status_label.setText(f"{item_text}旋转中：{axis} {angle:+.2f}°")
 
     def on_rotation_done(self, message):
         self.finish_rotation_diagnostics(message)
         self.rotation_running = False
-        self.rotation_button.setText("开始旋转")
-        self.rotation_status_label.setText(message if self.connected else "等待连接")
-        if self.connected:
-            self.set_controls_enabled(True)
-        self.rotation_axis_combo.setEnabled(True)
-        self.angular_speed_edit.setEnabled(True)
-        self.rotation_duration_edit.setEnabled(True)
         self.append_log(message)
+        if (
+            not self.rotation_sequence_stopping
+            and self.connected
+            and not self.rotation_sequence_blended
+            and self.rotation_sequence_index + 1 < len(self.rotation_sequence_items)
+        ):
+            self.rotation_sequence_index += 1
+            self.rotation_status_label.setText(
+                f"准备第 {self.rotation_sequence_index + 1}/{len(self.rotation_sequence_items)} 项..."
+            )
+            QTimer.singleShot(250, self.start_rotation_sequence_item)
+            return
+
+        completed_count = len(self.rotation_sequence_items)
+        self.rotation_sequence_items = []
+        self.rotation_sequence_stopping = False
+        self.rotation_sequence_blended = False
+        self.restore_rotation_controls()
+        if self.connected:
+            if completed_count > 1:
+                self.rotation_status_label.setText(f"运动序列已完成，共 {completed_count} 项")
+                self.append_log(f"IMU 运动序列已完成，共 {completed_count} 项")
+            else:
+                self.rotation_status_label.setText(message)
+        else:
+            self.rotation_status_label.setText("等待连接")
 
     def on_rotation_error(self, message):
         self.finish_rotation_diagnostics(f"旋转失败：{message}")
         self.rotation_running = False
-        self.rotation_button.setText("开始旋转")
+        self.rotation_sequence_items = []
+        self.rotation_sequence_stopping = False
+        self.rotation_sequence_blended = False
         self.rotation_status_label.setText("旋转失败" if self.connected else "等待连接")
         if self.connected:
-            self.set_controls_enabled(True)
             self.run_command("停止连续旋转", self.client_dash.Stop)
-        self.rotation_axis_combo.setEnabled(True)
-        self.angular_speed_edit.setEnabled(True)
-        self.rotation_duration_edit.setEnabled(True)
+        self.restore_rotation_controls()
         self.append_log(f"连续旋转失败：{message}")
         if self.connected:
             QMessageBox.critical(self, "连续旋转失败", message)

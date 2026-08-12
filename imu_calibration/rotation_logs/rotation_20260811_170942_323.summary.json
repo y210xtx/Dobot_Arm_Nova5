@@ -1,0 +1,62 @@
+{
+  "axis": "Rx",
+  "target_speed_deg_s": -5.0,
+  "duration_s": 5.0,
+  "user": 0,
+  "tool": 0,
+  "axis_frame": "tool",
+  "start_pose": [
+    335.91033935546875,
+    -66.84520721435547,
+    179.61099243164062,
+    90.00003814697266,
+    50.000022888183594,
+    90.00008392333984
+  ],
+  "csv_file": "D:\\Jay\\program\\Dobot_Arm_Ohand_Exc\\imu_calibration\\rotation_logs\\rotation_20260811_170942_323.csv",
+  "controller_v_percent": 24,
+  "global_speed_scale": 0.22,
+  "control_method": "RelMovLTool",
+  "finished_at": "2026-08-11T17:09:47",
+  "finish_reason": "旋转已完成",
+  "feedback": {
+    "count": 561,
+    "mean": -5.046587467824724,
+    "std": 1.0391526894718792,
+    "min": -5.932617205839183,
+    "max": 0.013732913100666563
+  },
+  "speed_error": {
+    "count": 561,
+    "mean": -0.046587467824723484,
+    "std": 1.0391526894718792,
+    "min": -0.9326172058391826,
+    "max": 5.013732913100666
+  },
+  "plateau_feedback": {
+    "count": 554,
+    "mean": -5.274429063508826,
+    "std": 0.32141754812007683,
+    "min": -5.932617205839183,
+    "max": -4.586791867484967
+  },
+  "cross_axis_rms_deg_s": {
+    "Ry": 0.08342757125938208,
+    "Rz": 5.152463787181512
+  },
+  "command_interval_ms": {
+    "count": 0,
+    "mean": null,
+    "std": null,
+    "min": null,
+    "max": null
+  },
+  "command_latency_ms": {
+    "count": 1,
+    "mean": 13.693399960175157,
+    "std": 0.0,
+    "min": 13.693399960175157,
+    "max": 13.693399960175157
+  },
+  "feedback_total_count": 623
+}
