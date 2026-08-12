@@ -1496,36 +1496,37 @@ class RobotUI(QMainWindow):
         rotation_grid.addWidget(self.rotation_status_label, 1, 2, 1, 4)
 
         combined_widget = QWidget()
-        combined_row = QHBoxLayout(combined_widget)
-        combined_row.setContentsMargins(0, 0, 0, 0)
-        combined_row.setSpacing(6)
-        combined_row.addWidget(QLabel("组合角速度："))
+        combined_grid = QGridLayout(combined_widget)
+        combined_grid.setContentsMargins(0, 0, 0, 0)
+        combined_grid.setHorizontalSpacing(6)
+        combined_grid.setVerticalSpacing(5)
+        combined_grid.addWidget(QLabel("组合角速度："), 0, 0)
         self.combined_speed_edits = {}
-        for name in ("Rx", "Ry", "Rz"):
-            combined_row.addWidget(QLabel(f"{name}："))
+        for index, name in enumerate(("Rx", "Ry", "Rz")):
+            combined_grid.addWidget(QLabel(f"{name}："), 0, index * 2 + 1)
             edit = QLineEdit("0")
             edit.setFixedWidth(52)
             edit.setToolTip("组合旋转角速度，单位：°/s")
             self.combined_speed_edits[name] = edit
-            combined_row.addWidget(edit)
-        combined_row.addWidget(QLabel("项间 CP："))
+            combined_grid.addWidget(edit, 0, index * 2 + 2)
+        combined_grid.addWidget(QLabel("项间 CP："), 1, 0)
         self.rotation_cp_edit = QLineEdit("100")
         self.rotation_cp_edit.setFixedWidth(42)
         self.rotation_cp_edit.setToolTip(
             "运动列表中相邻点的平滑过渡比例：0 为不平滑，100 为最大平滑"
         )
-        combined_row.addWidget(self.rotation_cp_edit)
-        combined_row.addWidget(QLabel("过渡："))
+        combined_grid.addWidget(self.rotation_cp_edit, 1, 1)
+        combined_grid.addWidget(QLabel("过渡："), 1, 2)
         self.rotation_transition_time_edit = QLineEdit("0.8")
         self.rotation_transition_time_edit.setFixedWidth(38)
         self.rotation_transition_time_edit.setToolTip("相邻运动项自动插值过渡总时长（秒）")
-        combined_row.addWidget(self.rotation_transition_time_edit)
-        combined_row.addWidget(QLabel("s / 段："))
+        combined_grid.addWidget(self.rotation_transition_time_edit, 1, 3)
+        combined_grid.addWidget(QLabel("秒 / 段数："), 1, 4)
         self.rotation_transition_steps_edit = QLineEdit("6")
         self.rotation_transition_steps_edit.setFixedWidth(30)
         self.rotation_transition_steps_edit.setToolTip("每个相邻运动项之间自动生成的插值段数（2～20）")
-        combined_row.addWidget(self.rotation_transition_steps_edit)
-        combined_row.addStretch()
+        combined_grid.addWidget(self.rotation_transition_steps_edit, 1, 5)
+        combined_grid.setColumnStretch(7, 1)
         rotation_grid.addWidget(combined_widget, 2, 0, 1, 6)
 
         self.add_combined_rotation_item_button = self.command_button(
@@ -1554,7 +1555,7 @@ class RobotUI(QMainWindow):
         rotation_grid.addWidget(plan_button_widget, 3, 0, 1, 6)
 
         self.rotation_plan_list = QListWidget()
-        self.rotation_plan_list.setMinimumHeight(150)
+        self.rotation_plan_list.setFixedHeight(170)
         self.rotation_plan_list.setStyleSheet("QListWidget::item { min-height: 24px; }")
         self.rotation_plan_list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.rotation_plan_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
@@ -1562,7 +1563,6 @@ class RobotUI(QMainWindow):
             "按添加顺序依次运行；每一项完成后，下一项会从机械臂当前反馈姿态开始"
         )
         rotation_grid.addWidget(self.rotation_plan_list, 4, 0, 1, 6)
-        rotation_grid.setRowStretch(4, 1)
         for column in range(6):
             rotation_grid.setColumnStretch(column, 1)
 
