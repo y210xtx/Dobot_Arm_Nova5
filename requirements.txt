@@ -1,0 +1,6 @@
+# Core robot communication API
+numpy==2.3.3
+requests==2.32.4
+
+# Six-axis calibration GUI (imu_calibration/)
+PySide6>=6.5
