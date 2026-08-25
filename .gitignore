@@ -29,6 +29,7 @@ Thumbs.db
 # Local packages and runtime output
 *.whl
 imu_calibration/rotation_logs/
+imu_calibration/quickcal_records/
 
 # Local calibration state (keep the committed defaults; ignore new local copies)
 imu_calibration/*.local.json

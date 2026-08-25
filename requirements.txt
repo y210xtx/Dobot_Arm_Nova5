@@ -1,5 +1,5 @@
 # Core robot communication API
-numpy==2.3.3
+numpy==2.2.6
 requests==2.32.4
 
 # Six-axis calibration GUI (imu_calibration/)
