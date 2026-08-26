@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import re
 import time
 from typing import Any
@@ -169,7 +170,10 @@ class RobotDevice(QObject):
             return False
         error_id = self.response_error_id(response)
         self.log_message.emit(f"{description}: {response}")
-        if error_id not in (0, None):
+        if error_id is None:
+            self.error_occurred.emit(f"{description}返回无法解析，按失败处理：{response!r}")
+            return False
+        if error_id != 0:
             self.error_occurred.emit(f"{description}被控制器拒绝：{response}")
             return False
         return True
@@ -198,6 +202,42 @@ class RobotDevice(QObject):
             return False
         return self._command("启用 Tool 坐标系", lambda: self.dashboard.Tool(int(tool)))
 
+    def set_and_activate_tool(
+        self, index: int, offset: tuple[float, ...]
+    ) -> bool:
+        index = int(index)
+        values = tuple(float(value) for value in offset)
+        if not 1 <= index <= 9:
+            self.error_occurred.emit("可配置的 Tool 编号必须在 1～9 范围内")
+            return False
+        if len(values) != 6 or not all(math.isfinite(value) for value in values):
+            self.error_occurred.emit("Tool 偏置必须包含 6 个有限数值")
+            return False
+        if any(abs(value) > 1000.0 for value in values[:3]):
+            self.error_occurred.emit("Tool X/Y/Z 偏置绝对值不能超过 1000 mm")
+            return False
+        if any(abs(value) > 180.0 for value in values[3:]):
+            self.error_occurred.emit("Tool Rx/Ry/Rz 偏置必须在 -180°～180°之间")
+            return False
+        table = "{" + ",".join(f"{value:.6f}" for value in values) + "}"
+        if not self._command(
+            f"保存 Tool {index} 坐标系",
+            lambda: self.dashboard.SetTool(index, table),
+        ):
+            return False
+        return self._command(
+            f"启用 Tool {index} 坐标系", lambda: self.dashboard.Tool(index)
+        )
+
+    def activate_tool(self, index: int) -> bool:
+        index = int(index)
+        if not 0 <= index <= 9:
+            self.error_occurred.emit("Tool 编号必须在 0～9 范围内")
+            return False
+        return self._command(
+            f"启用 Tool {index} 坐标系", lambda: self.dashboard.Tool(index)
+        )
+
     def move_pose_j(
         self,
         pose: tuple[float, ...],
@@ -221,6 +261,34 @@ class RobotDevice(QObject):
             ),
         )
 
+    def move_pose_l(
+        self,
+        pose: tuple[float, ...],
+        velocity_percent: int = 20,
+        user: int = -1,
+        tool: int = -1,
+    ) -> bool:
+        values = tuple(float(value) for value in pose)
+        if len(values) != 6 or not all(math.isfinite(value) for value in values):
+            self.error_occurred.emit("绝对目标位姿必须包含 6 个有限数值")
+            return False
+        if not 0 <= int(user) <= 9 or not 0 <= int(tool) <= 9:
+            self.error_occurred.emit("绝对运动的 User/Tool 编号必须在 0～9 范围内")
+            return False
+        velocity_percent = max(1, min(80, int(velocity_percent)))
+        return self._command(
+            "机械臂直线移动到绝对 TCP 位姿",
+            lambda: self.dashboard.MovL(
+                *values,
+                0,
+                user=int(user),
+                tool=int(tool),
+                a=20,
+                v=velocity_percent,
+                cp=0,
+            ),
+        )
+
     def move_joints(self, joints: tuple[float, ...], velocity_percent: int = 15) -> bool:
         if len(joints) != 6:
             self.error_occurred.emit("目标关节位姿必须包含 J1～J6 六个值")
@@ -237,17 +305,84 @@ class RobotDevice(QObject):
         )
 
     def relative_tool_rotation(self, axis: str, degrees: float, velocity_percent: int = 20) -> bool:
-        offsets = [0.0] * 6
         try:
-            offsets[{"Rx": 3, "Ry": 4, "Rz": 5}[axis]] = float(degrees)
+            axis_index = {"Rx": 3, "Ry": 4, "Rz": 5}[axis]
         except KeyError:
             self.error_occurred.emit(f"不支持的 Tool 旋转轴：{axis}")
             return False
+        degrees = float(degrees)
+        if not math.isfinite(degrees) or abs(degrees) < 0.1 or abs(degrees) > 180.0:
+            self.error_occurred.emit("Tool 相对旋转角度绝对值必须在 0.1°～180°之间")
+            return False
+        velocity_percent = max(1, min(80, int(velocity_percent)))
+        # Avoid crossing the controller's +/-180 degree orientation boundary in
+        # one command. Equal segments also avoid leaving a tiny final segment.
+        segment_count = max(1, math.ceil(abs(degrees) / 170.0))
+        segment_degrees = degrees / segment_count
+        for index in range(segment_count):
+            offsets = [0.0] * 6
+            offsets[axis_index] = segment_degrees
+            cp = 100 if index < segment_count - 1 else 0
+            if not self._command(
+                f"Tool {axis} 相对旋转 {segment_degrees:+.2f}°"
+                f"（{index + 1}/{segment_count}）",
+                lambda offsets=tuple(offsets), cp=cp: self.dashboard.RelMovLTool(
+                    *offsets, user=-1, tool=-1, a=20, v=velocity_percent, cp=cp
+                ),
+            ):
+                return False
+        return True
+
+    def relative_tool_move(
+        self, offset: tuple[float, ...], velocity_percent: int = 20
+    ) -> bool:
+        values = tuple(float(value) for value in offset)
+        if len(values) != 6 or not all(math.isfinite(value) for value in values):
+            self.error_occurred.emit("Tool 相对运动必须包含 6 个有限数值")
+            return False
+        if not any(abs(value) >= 0.001 for value in values):
+            self.error_occurred.emit("Tool 相对运动量不能全部为 0")
+            return False
+        if any(abs(value) > 500.0 for value in values[:3]):
+            self.error_occurred.emit("单次 Tool X/Y/Z 相对位移绝对值不能超过 500 mm")
+            return False
+        if any(abs(value) > 180.0 for value in values[3:]):
+            self.error_occurred.emit("单次 Tool Rx/Ry/Rz 相对角度必须在 -180°～180°之间")
+            return False
+        velocity_percent = max(1, min(80, int(velocity_percent)))
         return self._command(
-            f"Tool {axis} 相对旋转 {degrees:+.1f}°",
+            "Tool 坐标系末端相对运动",
             lambda: self.dashboard.RelMovLTool(
-                *offsets, user=-1, tool=-1, a=20, v=int(velocity_percent), cp=0
+                *values, user=-1, tool=-1, a=20, v=velocity_percent, cp=0
             ),
+        )
+
+    def start_tool_jog(
+        self,
+        axis: str,
+        positive: bool,
+        speed_factor_percent: int,
+        user: int = -1,
+        tool: int = -1,
+    ) -> bool:
+        if axis not in ("Rx", "Ry", "Rz"):
+            self.error_occurred.emit(f"不支持的 Tool 点动轴：{axis}")
+            return False
+        speed_factor_percent = max(1, min(80, int(speed_factor_percent)))
+        if not self.set_speed_factor(speed_factor_percent):
+            return False
+        command = f"{axis}{'+' if positive else '-'}"
+        return self._command(
+            f"Tool {axis} {'正向' if positive else '反向'}连续点动",
+            lambda: self.dashboard.MoveJog(
+                command, coordtype=2, user=int(user), tool=int(tool)
+            ),
+        )
+
+    def stop_tool_jog(self) -> bool:
+        return self._command(
+            "停止 Tool 连续点动",
+            lambda: self.dashboard.MoveJog(""),
         )
 
     @Slot(object)

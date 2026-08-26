@@ -36,6 +36,10 @@ MCAL_CAPTURE_MAG = 0x08
 
 ALL_IMU_MASK = 0x07FF
 MAX_PAYLOAD_LENGTH = 256 * 1024
+EXPECTED_VERSION_PAYLOAD_VERSION = 1
+EXPECTED_MCAL_REPORT_VERSION = 2
+EXPECTED_MCAL_PAYLOAD_LENGTH = 1046
+EXPECTED_GYRO_SEGMENTS = 6
 
 
 @dataclass(frozen=True)
@@ -116,6 +120,7 @@ class VersionFrame:
     imu_model: str
     hand_side: str
     features: int
+    payload: bytes = field(default=b"", repr=False)
 
     @property
     def factory_intrinsic(self) -> bool:
@@ -159,20 +164,41 @@ class McalReportFrame:
     payload: bytes = field(repr=False)
 
     @property
+    def format_valid(self) -> bool:
+        return (
+            len(self.payload) == EXPECTED_MCAL_PAYLOAD_LENGTH
+            and self.context == CMD_MCAL_COMMIT
+            and self.version == EXPECTED_MCAL_REPORT_VERSION
+            and self.imu_count == 11
+        )
+
+    @property
     def gyro_all_ok(self) -> bool:
         return (
-            self.status == 0
-            and self.imu_count == 11
+            self.format_valid
+            and self.status == 0
             and self.calibrated_count == 11
+            and bool(self.flags & 0x01)
             and len(self.gyro_quality) == 11
-            and all(item.ok for item in self.gyro_quality)
+            and len(self.gyro_matrices) == 11
+            and all(item.ok and item.window_count >= EXPECTED_GYRO_SEGMENTS for item in self.gyro_quality)
         )
 
     @property
     def accel_all_ok(self) -> bool:
-        return bool(self.flags & 0x02) and len(self.accel_quality) == 11 and all(
-            item.ok for item in self.accel_quality
+        return (
+            self.format_valid
+            and self.status == 0
+            and self.calibrated_count == 11
+            and bool(self.flags & 0x02)
+            and len(self.accel_quality) == 11
+            and len(self.accel_matrices) == 11
+            and all(item.ok for item in self.accel_quality)
         )
+
+    @property
+    def factory_pass(self) -> bool:
+        return self.gyro_all_ok and self.accel_all_ok
 
 
 @dataclass
@@ -340,7 +366,7 @@ class ProtocolParser:
 
     @staticmethod
     def _parse_version(payload: bytes) -> VersionFrame:
-        if len(payload) < 48 or payload[0] != CMD_GET_VERSION:
+        if len(payload) != 48 or payload[0] != CMD_GET_VERSION:
             raise ValueError("invalid version payload")
         model = "IIM-42652" if payload[39] == 1 else "LSM6DSV16X"
         hand = "左手" if payload[40] == 1 else "右手"
@@ -353,6 +379,7 @@ class ProtocolParser:
             model,
             hand,
             payload[41],
+            bytes(payload),
         )
 
     @staticmethod
@@ -368,9 +395,11 @@ class ProtocolParser:
         return tuple(matrices)
 
     def _parse_mcal(self, seq: int, payload: bytes) -> McalReportFrame:
-        if len(payload) < 12:
-            raise ValueError("short MCAL report")
-        imu_count = min(payload[2], 11)
+        if len(payload) != EXPECTED_MCAL_PAYLOAD_LENGTH:
+            raise ValueError("invalid MCAL report length")
+        if payload[0] != CMD_MCAL_COMMIT or payload[1] != EXPECTED_MCAL_REPORT_VERSION or payload[2] != 11:
+            raise ValueError("unsupported MCAL report header")
+        imu_count = 11
         gyro_quality: list[GyroQuality] = []
         if len(payload) >= 12 + imu_count * 8:
             for index in range(imu_count):

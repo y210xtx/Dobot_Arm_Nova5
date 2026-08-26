@@ -37,6 +37,11 @@ class SessionRecorder:
         self.started_monotonic_ns = time.monotonic_ns()
         self._open_csv("markers", "stage_markers.csv", ("host_ns", "elapsed_ms", "event", "step", "detail"))
         self._open_csv(
+            "cdc",
+            "cdc_bytes.csv",
+            ("host_ns", "elapsed_ms", "direction", "byte_count", "data_hex"),
+        )
+        self._open_csv(
             "raw_imu",
             "raw_imu.csv",
             ("host_ns", "elapsed_ms", "step", "seq", "presence_mask", "imu", "gx_rads", "gy_rads", "gz_rads", "ax_g", "ay_g", "az_g"),
@@ -87,6 +92,17 @@ class SessionRecorder:
         self._writers["markers"].writerow((now, f"{elapsed:.3f}", event, step, detail))
         self._files["markers"].flush()
 
+    def cdc_bytes(self, direction: str, data: bytes) -> None:
+        """Persist every TX frame and RX read chunk losslessly as hexadecimal bytes."""
+        if not self.active or not data:
+            return
+        now, elapsed = self._time()
+        raw = bytes(data)
+        self._writers["cdc"].writerow(
+            (now, f"{elapsed:.3f}", direction, len(raw), raw.hex(" "))
+        )
+        self._files["cdc"].flush()
+
     def raw_imu(self, step: str, frame) -> None:
         if not self.active:
             return
@@ -136,8 +152,10 @@ class SessionRecorder:
             "flags": report.flags,
             "mean_rms_mdeg": report.mean_rms_mdeg,
             "bad_off_axis_count": report.bad_off_axis_count,
+            "format_valid": report.format_valid,
             "gyro_all_ok": report.gyro_all_ok,
             "accel_all_ok": report.accel_all_ok,
+            "factory_pass": report.factory_pass,
             "gyro_quality": [asdict(item) for item in report.gyro_quality],
             "accel_quality": [
                 {"ok": item.ok, "raw_hex": item.raw.hex()} for item in report.accel_quality

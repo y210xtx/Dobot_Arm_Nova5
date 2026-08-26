@@ -31,6 +31,8 @@ class GloveDevice(QObject):
     version_received = Signal(object)
     mcal_report_received = Signal(object)
     stats_changed = Signal(object)
+    tx_bytes_sent = Signal(object)
+    rx_bytes_received = Signal(object)
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -94,6 +96,7 @@ class GloveDevice(QObject):
             self.error_occurred.emit(f"手套命令 0x{command:02X} 发送失败：{self.serial.errorString()}")
             return False
         self.serial.flush()
+        self.tx_bytes_sent.emit(frame)
         self.log_message.emit(f"TX cmd=0x{command:02X} arg=0x{argument:02X} payload={payload.hex(' ')}")
         return True
 
@@ -103,6 +106,7 @@ class GloveDevice(QObject):
     @Slot()
     def _on_ready_read(self) -> None:
         data = bytes(self.serial.readAll())
+        self.rx_bytes_received.emit(data)
         for frame_type, frame in self.parser.feed(data):
             if frame_type == TYPE_RAW_IMU:
                 self.raw_imu_received.emit(frame)

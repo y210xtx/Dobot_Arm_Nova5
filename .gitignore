@@ -2,20 +2,33 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.python-version
 
 # Virtual environments
 .venv/
 venv/
 env/
 ENV/
+.conda/
+
+# Local environment variables and secrets
+.env
+.env.*
+!.env.example
 
 # Test, coverage, and build artifacts
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.hypothesis/
+.tox/
+.nox/
 .coverage
+.coverage.*
 coverage.xml
+coverage.json
 htmlcov/
+junit*.xml
 build/
 dist/
 *.egg-info/
@@ -25,11 +38,22 @@ dist/
 .idea/
 .DS_Store
 Thumbs.db
+*.code-workspace
+
+# Logs, crash dumps, and temporary files
+*.log
+*.pid
+*.dmp
+*.tmp
+*.bak
+*.swp
+*~
 
 # Local packages and runtime output
 *.whl
 imu_calibration/rotation_logs/
 imu_calibration/quickcal_records/
+SDB_QuickCal_*/
 
-# Local calibration state (keep the committed defaults; ignore new local copies)
+# Machine-specific calibration state (keep committed defaults tracked)
 imu_calibration/*.local.json
