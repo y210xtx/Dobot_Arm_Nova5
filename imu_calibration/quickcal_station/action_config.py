@@ -26,8 +26,8 @@ class RobotActionConfig:
             raise ValueError(f"不支持的 Tool 旋转轴：{self.axis}")
         if not math.isfinite(self.degrees) or not 0.1 <= abs(self.degrees) <= 180.0:
             raise ValueError("相对旋转角度绝对值必须在 0.1°～180°之间")
-        if not 1 <= int(self.velocity_percent) <= 80:
-            raise ValueError("自动标定动作速度比例必须在 1%～80% 之间")
+        if not 1 <= int(self.velocity_percent) <= 100:
+            raise ValueError("自动标定动作速度比例必须在 1%～100% 之间")
         if not math.isfinite(self.timeout_s) or not 5.0 <= self.timeout_s <= 180.0:
             raise ValueError("动作超时必须在 5～180 秒之间")
 
@@ -58,6 +58,18 @@ DEFAULT_ACTIONS = {
     "A04": RobotActionConfig(axis="Rz", degrees=-180.0),
     "A05": RobotActionConfig(axis="Rx", degrees=90.0),
     "A06": RobotActionConfig(axis="Rx", degrees=-180.0),
+    # r024 stage axes mapped from the 2026-08-27 raw-stream diagnosis.
+    # For G stages ``degrees`` is the signed effective capture sweep.  The
+    # short ±45°/6 s window follows the mechanically limited Tool Rx axis.
+    # Six-face-derived transforms of the raw streams show Rx/Ry/Rz mapping
+    # to fixture X/Y/Z respectively; sensor-local gx/gy/gz must not be used
+    # directly because the eleven IMUs have different mounting rotations.
+    "G01": RobotActionConfig(axis="Rx", degrees=90.0),
+    "G02": RobotActionConfig(axis="Rx", degrees=-90.0),
+    "G03": RobotActionConfig(axis="Ry", degrees=150.0),
+    "G04": RobotActionConfig(axis="Ry", degrees=-150.0),
+    "G05": RobotActionConfig(axis="Rz", degrees=150.0),
+    "G06": RobotActionConfig(axis="Rz", degrees=-150.0),
 }
 
 

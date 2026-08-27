@@ -248,6 +248,7 @@ class RobotDevice(QObject):
         if len(pose) != 6:
             self.error_occurred.emit("目标位姿必须包含 X/Y/Z/Rx/Ry/Rz 六个值")
             return False
+        velocity_percent = max(1, min(100, int(velocity_percent)))
         return self._command(
             "机械臂移动到目标位姿",
             lambda: self.dashboard.MovJ(
@@ -256,7 +257,7 @@ class RobotDevice(QObject):
                 user=int(user),
                 tool=int(tool),
                 a=20,
-                v=int(velocity_percent),
+                v=velocity_percent,
                 cp=0,
             ),
         )
@@ -275,7 +276,7 @@ class RobotDevice(QObject):
         if not 0 <= int(user) <= 9 or not 0 <= int(tool) <= 9:
             self.error_occurred.emit("绝对运动的 User/Tool 编号必须在 0～9 范围内")
             return False
-        velocity_percent = max(1, min(80, int(velocity_percent)))
+        velocity_percent = max(1, min(100, int(velocity_percent)))
         return self._command(
             "机械臂直线移动到绝对 TCP 位姿",
             lambda: self.dashboard.MovL(
@@ -293,18 +294,25 @@ class RobotDevice(QObject):
         if len(joints) != 6:
             self.error_occurred.emit("目标关节位姿必须包含 J1～J6 六个值")
             return False
+        velocity_percent = max(1, min(100, int(velocity_percent)))
         return self._command(
             "机械臂移动到示教关节位",
             lambda: self.dashboard.MovJ(
                 *joints,
                 1,
                 a=20,
-                v=int(velocity_percent),
+                v=velocity_percent,
                 cp=0,
             ),
         )
 
-    def relative_tool_rotation(self, axis: str, degrees: float, velocity_percent: int = 20) -> bool:
+    def relative_tool_rotation(
+        self,
+        axis: str,
+        degrees: float,
+        velocity_percent: int = 20,
+        acceleration_percent: int = 20,
+    ) -> bool:
         try:
             axis_index = {"Rx": 3, "Ry": 4, "Rz": 5}[axis]
         except KeyError:
@@ -314,7 +322,8 @@ class RobotDevice(QObject):
         if not math.isfinite(degrees) or abs(degrees) < 0.1 or abs(degrees) > 180.0:
             self.error_occurred.emit("Tool 相对旋转角度绝对值必须在 0.1°～180°之间")
             return False
-        velocity_percent = max(1, min(80, int(velocity_percent)))
+        velocity_percent = max(1, min(100, int(velocity_percent)))
+        acceleration_percent = max(1, min(100, int(acceleration_percent)))
         # Avoid crossing the controller's +/-180 degree orientation boundary in
         # one command. Equal segments also avoid leaving a tiny final segment.
         segment_count = max(1, math.ceil(abs(degrees) / 170.0))
@@ -327,7 +336,12 @@ class RobotDevice(QObject):
                 f"Tool {axis} 相对旋转 {segment_degrees:+.2f}°"
                 f"（{index + 1}/{segment_count}）",
                 lambda offsets=tuple(offsets), cp=cp: self.dashboard.RelMovLTool(
-                    *offsets, user=-1, tool=-1, a=20, v=velocity_percent, cp=cp
+                    *offsets,
+                    user=-1,
+                    tool=-1,
+                    a=acceleration_percent,
+                    v=velocity_percent,
+                    cp=cp,
                 ),
             ):
                 return False
@@ -349,7 +363,7 @@ class RobotDevice(QObject):
         if any(abs(value) > 180.0 for value in values[3:]):
             self.error_occurred.emit("单次 Tool Rx/Ry/Rz 相对角度必须在 -180°～180°之间")
             return False
-        velocity_percent = max(1, min(80, int(velocity_percent)))
+        velocity_percent = max(1, min(100, int(velocity_percent)))
         return self._command(
             "Tool 坐标系末端相对运动",
             lambda: self.dashboard.RelMovLTool(
@@ -368,12 +382,36 @@ class RobotDevice(QObject):
         if axis not in ("Rx", "Ry", "Rz"):
             self.error_occurred.emit(f"不支持的 Tool 点动轴：{axis}")
             return False
-        speed_factor_percent = max(1, min(80, int(speed_factor_percent)))
+        speed_factor_percent = max(1, min(100, int(speed_factor_percent)))
         if not self.set_speed_factor(speed_factor_percent):
             return False
         command = f"{axis}{'+' if positive else '-'}"
         return self._command(
             f"Tool {axis} {'正向' if positive else '反向'}连续点动",
+            lambda: self.dashboard.MoveJog(
+                command, coordtype=2, user=int(user), tool=int(tool)
+            ),
+        )
+
+    def switch_tool_jog(
+        self,
+        axis: str,
+        positive: bool,
+        user: int = -1,
+        tool: int = -1,
+    ) -> bool:
+        """Start another Tool jog direction without changing SpeedFactor.
+
+        Magnetic trajectories switch axes while the controller is decelerating
+        from the previous jog.  Reusing the already accepted speed factor avoids
+        a SpeedFactor command being rejected during that short transition.
+        """
+        if axis not in ("Rx", "Ry", "Rz"):
+            self.error_occurred.emit(f"不支持的 Tool 点动轴：{axis}")
+            return False
+        command = f"{axis}{'+' if positive else '-'}"
+        return self._command(
+            f"切换 Tool {axis} {'正向' if positive else '反向'}连续点动",
             lambda: self.dashboard.MoveJog(
                 command, coordtype=2, user=int(user), tool=int(tool)
             ),

@@ -48,9 +48,20 @@ from .action_config import (
 )
 from .glove_device import GloveDevice
 from .pose_store import TaughtPose, load_legacy_safe_pose, load_pose_config, save_pose_config
-from .protocol import ALL_IMU_MASK
+from .protocol import ALL_IMU_MASK, EXPECTED_GYRO_SEGMENTS
 from .robot_device import RobotDevice
-from .workflow import IMU_NAMES, YawLimits, expected_capture_seconds, expected_total_seconds, steps_for_limits
+from .workflow import (
+    LIMITED_GYRO_ACCEL_DECEL_DEG,
+    LIMITED_GYRO_CAPTURE_BOUND_DEG,
+    LIMITED_GYRO_CAPTURE_S,
+    LIMITED_GYRO_OUTER_DEG,
+    IMU_NAMES,
+    ROLL_PITCH_GYRO_RATE_DEG_S,
+    YawLimits,
+    expected_capture_seconds,
+    expected_total_seconds,
+    steps_for_limits,
+)
 
 
 APP_DIR = Path(__file__).resolve().parent.parent
@@ -61,13 +72,73 @@ ACTION_CONFIG_FILE = APP_DIR / "quickcal_actions.local.json"
 ROTATION_SPEED_CALIBRATION_FILE = APP_DIR / "rotation_speed_calibration.json"
 TOOL_CONFIG_FILE = APP_DIR / "tool_offset_config.json"
 
-G01_RESTORE_DEG = 90.0
-G01_LEAD_IN_DEG = -85.0
-G01_CAPTURE_START_DEG = -75.0
-G01_TARGET_RATE_DEG_S = 15.0
-G01_RATE_TOLERANCE_DEG_S = 3.0
-G01_SPEED_STABLE_NS = 300_000_000
-G01_TIMEOUT_S = 90.0
+MCAL_STATUS_LABELS = {
+    1: "状态不允许",
+    5: "Flash 写入失败",
+    11: "质量不足",
+    15: "阶段状态错误",
+}
+
+MANUAL_POSITION_TOLERANCE_MM = 2.0
+MANUAL_ANGLE_TOLERANCE_DEG = 1.0
+MANUAL_MOTION_START_GRACE_NS = 1_500_000_000
+MANUAL_MOTION_STABLE_NS = 500_000_000
+MANUAL_MOTION_TIMEOUT_NS = 60_000_000_000
+
+GYRO_AUTO_STEPS = ("G01", "G02", "G03", "G04", "G05", "G06")
+GYRO_LIMITED_STEPS = ("G01", "G02")
+G01_RESTORE_RX_DEG = 90.0
+G02_RESTORE_NEUTRAL_RZ_DEG = 90.0
+GYRO_RATE_TOLERANCE_DEG_S = 3.0
+GYRO_SPEED_STABLE_NS = 300_000_000
+GYRO_TIMEOUT_S = 90.0
+GYRO_MISSED_START_MARGIN_DEG = 2.0
+GYRO_ENDPOINT_TOLERANCE_DEG = 2.0
+GYRO_POSTPOSITION_SPEED_PERCENT = 15
+GYRO_POSTPOSITION_ACCEL_PERCENT = 5
+GYRO_TRANSIT_SPEED_PERCENT = 80
+GYRO_RETURN_SPEED_PERCENT = 100
+NEUTRAL_RETURN_SPEED_PERCENT = 60
+# Fraction of the outer region already travelled, followed by the fraction of
+# the calibrated jog SpeedFactor to retain.  The fitted capture window has
+# already closed before this S-shaped deceleration starts.
+GYRO_SMOOTH_DECEL_PROFILE = (
+    (0.00, 0.85),
+    (0.18, 0.70),
+    (0.36, 0.55),
+    (0.54, 0.40),
+    (0.70, 0.28),
+    (0.82, 0.18),
+    (0.90, 0.10),
+)
+GYRO_SMOOTH_STOP_MARGIN_DEG = 0.35
+
+MAG_AUTO_STEPS = ("M01", "M02", "M03", "M04")
+MAG_RATE_TOLERANCE_DEG_S = 4.0
+MAG_TIMEOUT_S = 60.0
+MAG_NEUTRAL_TOLERANCE_DEG = 2.0
+MAG_YAW_SAFE_DEG = 75.0
+MAG_TARGET_RATE_DEG_S = {"M01": 12.0, "M02": 10.0, "M03": 10.0}
+# The path shapes come from the robot work order; only their durations are
+# Legacy magnetic-motion helpers retained for old local configurations; r024
+# never places an M stage in the executable workflow.
+MAG_TRAJECTORIES = {
+    "M01": (
+        ("Rx", True, 2.5),
+        ("Ry", True, 2.5),
+        ("Rx", False, 5.0),
+        ("Ry", False, 5.0),
+    ),
+    "M02": (("Rz", True, 7.5), ("Rz", False, 7.5)),
+    "M03": (("Rz", False, 7.5), ("Rz", True, 7.5)),
+    "M04": (),
+}
+MAG_STEP_BUTTON_TEXT = {
+    "M01": "自动执行 M01 Roll/Pitch 翻转",
+    "M02": "自动执行 M02 Yaw 正向往返",
+    "M03": "自动执行 M03 Yaw 负向往返",
+    "M04": "自动执行 M04 中位静止",
+}
 
 
 STYLE = """
@@ -158,6 +229,7 @@ class QuickCalWindow(QMainWindow):
         self._building_action_config = False
         self._ui_raw_imu_frame = None
         self._ui_raw_imu_ns = 0
+        self._ui_register_imu_frame = None
         self._ui_register_imu_ns = 0
         self._robot_enable_pending: bool | None = None
         self._robot_enable_timeout = QTimer(self)
@@ -169,13 +241,35 @@ class QuickCalWindow(QMainWindow):
         self._auto_action_deadline_ns = 0
         self._auto_action_stable_since_ns = 0
         self._auto_action_seen_motion = False
-        self._g01_phase = ""
-        self._g01_phase_started_ns = 0
-        self._g01_reference_pose: tuple[float, ...] | None = None
-        self._g01_original_speed_factor = 0
-        self._g01_jog_active = False
+        self._full_auto_enabled = False
+        self._full_auto_timer = QTimer(self)
+        self._full_auto_timer.setInterval(250)
+        self._full_auto_timer.timeout.connect(self._try_start_full_auto_step)
+        self._full_auto_safe_return_started_ns = 0
+        self._full_auto_safe_return_seen_motion = False
+        self._gyro_x_phase = ""
+        self._gyro_x_phase_started_ns = 0
+        self._gyro_x_reference_pose: tuple[float, ...] | None = None
+        self._gyro_x_original_speed_factor = 0
+        self._gyro_x_jog_speed_factor = 0
+        self._gyro_x_decel_level = -1
+        self._gyro_x_jog_active = False
+        self._mag_phase = ""
+        self._mag_phase_started_ns = 0
+        self._mag_segment_index = -1
+        self._mag_reference_pose: tuple[float, ...] | None = None
+        self._mag_original_speed_factor = 0
+        self._mag_speed_factor = 0
+        self._mag_speed_source = ""
+        self._mag_jog_active = False
         self._manual_absolute_pose_initialized = False
         self._manual_absolute_pose_frame: tuple[int, int] | None = None
+        self._manual_motion_target: tuple[float, ...] | None = None
+        self._manual_motion_frame: tuple[int, int] | None = None
+        self._manual_motion_kind = ""
+        self._manual_motion_started_ns = 0
+        self._manual_motion_stable_since_ns = 0
+        self._manual_motion_seen_motion = False
 
         root = QWidget()
         root.setObjectName("root")
@@ -206,7 +300,7 @@ class QuickCalWindow(QMainWindow):
         titles = QVBoxLayout()
         title = QLabel("11 路 IMU 机械臂工厂标定")
         title.setObjectName("headline")
-        subtitle = QLabel("QuickCal V1｜30 s 静止 + 六面 + 六方向 15°/s + 分段三维磁翻转")
+        subtitle = QLabel("QuickCal V1｜一次启动、逐步门控、全流程自动执行")
         subtitle.setObjectName("subheadline")
         titles.addWidget(title)
         titles.addWidget(subtitle)
@@ -258,8 +352,6 @@ class QuickCalWindow(QMainWindow):
         self.robot_teach_neutral.setProperty("secondary", True)
         self.robot_neutral = QPushButton("到标定中位")
         self.robot_neutral.setProperty("secondary", True)
-        self.robot_pose_label = QLabel()
-        self.robot_pose_label.setWordWrap(True)
         self.robot_state_label = QLabel("mode=--｜TCP=--")
         robot_grid.addWidget(QLabel("IP"), 0, 0)
         robot_grid.addWidget(self.robot_ip, 0, 1, 1, 2)
@@ -271,8 +363,7 @@ class QuickCalWindow(QMainWindow):
         robot_grid.addWidget(self.robot_teach_safe, 2, 0)
         robot_grid.addWidget(self.robot_teach_neutral, 2, 1)
         robot_grid.addWidget(self.robot_neutral, 2, 2, 1, 2)
-        robot_grid.addWidget(self.robot_pose_label, 3, 0, 1, 4)
-        robot_grid.addWidget(self.robot_state_label, 4, 0, 1, 4)
+        robot_grid.addWidget(self.robot_state_label, 3, 0, 1, 4)
         self._refresh_taught_pose_label()
         layout.addWidget(robot_group, 5)
 
@@ -316,7 +407,7 @@ class QuickCalWindow(QMainWindow):
     def _build_main_tabs(self) -> QTabWidget:
         tabs = QTabWidget()
         tabs.addTab(self._build_station_page(), "标定工站")
-        tabs.addTab(self._build_limits_page(), "Yaw 限位与流程参数")
+        tabs.addTab(self._build_limits_page(), "G01/G02 固定运动参数")
         tabs.addTab(self._build_report_page(), "最终质量报告")
         tabs.addTab(self._build_actions_page(), "机械臂动作配置")
         tabs.addTab(self._build_tool_motion_page(), "Tool 与手动运动")
@@ -354,14 +445,15 @@ class QuickCalWindow(QMainWindow):
         self.imu_table.setAlternatingRowColors(True)
         self.imu_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.imu_table.verticalHeader().setVisible(False)
+        self.imu_table.verticalHeader().setDefaultSectionSize(28)
         self.imu_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         health_layout.addWidget(self.imu_table)
-        right_layout.addWidget(health_group, 3)
+        right_layout.addWidget(health_group, 1)
 
         feedback_group = QGroupBox("设备数据状态与日志")
         feedback_layout = QVBoxLayout(feedback_group)
         self.health_label = QLabel("等待 Dobot 机械臂与 IMU 手套连接")
-        self.health_label.setWordWrap(True)
+        self.health_label.setWordWrap(False)
         self.health_label.setToolTip(
             "Dobot 机械臂反馈来自机械臂实时反馈端口；"
             "type=5/8/9/11 均来自 IMU 手套串口。"
@@ -371,7 +463,7 @@ class QuickCalWindow(QMainWindow):
         self.log_text.document().setMaximumBlockCount(1200)
         feedback_layout.addWidget(self.health_label)
         feedback_layout.addWidget(self.log_text, 1)
-        right_layout.addWidget(feedback_group, 2)
+        right_layout.addWidget(feedback_group, 1)
         splitter.addWidget(right)
         splitter.setSizes((860, 600))
         layout.addWidget(splitter)
@@ -380,22 +472,22 @@ class QuickCalWindow(QMainWindow):
     def _build_limits_page(self) -> QWidget:
         page = QWidget()
         layout = QHBoxLayout(page)
-        input_group = QGroupBox("Yaw 软限位输入（来自控制器实际配置）")
+        input_group = QGroupBox("G01/G02 当前配置轴的固定运动参数")
         form = QFormLayout(input_group)
-        self.yaw_negative = QLineEdit("-50")
-        self.yaw_positive = QLineEdit("50")
-        self.yaw_margin = QLineEdit("10")
-        self.yaw_rate = QLineEdit("15")
-        self.yaw_min_capture = QLineEdit("2")
+        self.yaw_negative = QLineEdit(f"{-LIMITED_GYRO_OUTER_DEG:g}")
+        self.yaw_positive = QLineEdit(f"{LIMITED_GYRO_OUTER_DEG:g}")
+        self.yaw_margin = QLineEdit(f"{LIMITED_GYRO_ACCEL_DECEL_DEG:g}")
+        self.yaw_rate = QLineEdit(f"{ROLL_PITCH_GYRO_RATE_DEG_S:g}")
+        self.yaw_min_capture = QLineEdit(f"{LIMITED_GYRO_CAPTURE_S:g}")
         for label, edit in (
-            ("负向软限位（°）", self.yaw_negative),
-            ("正向软限位（°）", self.yaw_positive),
-            ("两端安全余量（°）", self.yaw_margin),
-            ("标定角速度（°/s）", self.yaw_rate),
-            ("最短有效采集（s）", self.yaw_min_capture),
+            ("完整运动负端点（°）", self.yaw_negative),
+            ("完整运动正端点（°）", self.yaw_positive),
+            ("单端加/减速区（°）", self.yaw_margin),
+            ("匀速角速度（°/s）", self.yaw_rate),
+            ("固定有效采集（s）", self.yaw_min_capture),
         ):
             form.addRow(label, edit)
-            edit.textChanged.connect(self._refresh_limits)
+            edit.setReadOnly(True)
         layout.addWidget(input_group)
         result_group = QGroupBox("自动计算与强制联锁")
         result_layout = QVBoxLayout(result_group)
@@ -405,8 +497,8 @@ class QuickCalWindow(QMainWindow):
         self.timeline_summary = QLabel()
         self.timeline_summary.setWordWrap(True)
         warning = QLabel(
-            "所有 Yaw 动作必须从 0° 中位进入，完成后回 0°；严禁累计转角。"
-            "移动、加减速、反向和回中位均不得进入拟合采集窗口。"
+            "G01/G02 必须从实测夹具 X 对应的 Tool Rx 0° 中位进入，完整行程固定为 -55°～+55°；"
+            "只有 -45°～+45° 的 6 秒匀速段进入拟合，加减速和回中位不采集。"
         )
         warning.setWordWrap(True)
         warning.setStyleSheet("color:#b42318;background:#fff1f2;border:1px solid #fecdd3;border-radius:6px;padding:9px;")
@@ -422,14 +514,21 @@ class QuickCalWindow(QMainWindow):
         layout = QVBoxLayout(page)
         self.report_summary = QLabel("尚未收到 type=7 最终报告")
         self.report_summary.setWordWrap(True)
-        self.report_table = QTableWidget(11, 6)
-        self.report_table.setHorizontalHeaderLabels(("IMU", "Gyro", "RMS（°）", "窗口数", "最大偏差", "Accel"))
+        self.report_table = QTableWidget(11, 8)
+        self.report_table.setHorizontalHeaderLabels(
+            ("IMU", "Gyro", "Gyro拒绝原因", "RMS（°）", "窗口数", "最大非对角", "Accel", "Accel诊断")
+        )
         self.report_table.verticalHeader().setVisible(False)
         self.report_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.report_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        report_header = self.report_table.horizontalHeader()
+        report_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        report_header.setMinimumSectionSize(60)
+        report_header.setStretchLastSection(False)
+        for column, width in enumerate((130, 90, 270, 105, 90, 115, 90, 330)):
+            self.report_table.setColumnWidth(column, width)
         for row, name in enumerate(IMU_NAMES):
             self.report_table.setItem(row, 0, QTableWidgetItem(name))
-            for column in range(1, 6):
+            for column in range(1, 8):
                 self.report_table.setItem(row, column, QTableWidgetItem("--"))
         layout.addWidget(self.report_summary)
         layout.addWidget(self.report_table)
@@ -441,7 +540,7 @@ class QuickCalWindow(QMainWindow):
         layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(10)
 
-        config_group = QGroupBox("六面步骤自动旋转参数")
+        config_group = QGroupBox("各标定阶段机械臂旋转参数")
         config_layout = QVBoxLayout(config_group)
         config_layout.setContentsMargins(14, 16, 14, 14)
         config_layout.setSpacing(12)
@@ -477,7 +576,7 @@ class QuickCalWindow(QMainWindow):
         self.action_rotation_degrees.setValue(config.degrees)
         self.action_rotation_degrees.setSuffix(" °")
         self.action_velocity = QSpinBox()
-        self.action_velocity.setRange(1, 80)
+        self.action_velocity.setRange(1, 100)
         self.action_velocity.setValue(config.velocity_percent)
         self.action_velocity.setSuffix(" %")
         self.action_timeout = QDoubleSpinBox()
@@ -487,7 +586,7 @@ class QuickCalWindow(QMainWindow):
         self.action_timeout.setSuffix(" s")
         parameter_widgets = (
             ("Tool 旋转轴", self.action_rotation_axis),
-            ("相对旋转角度", self.action_rotation_degrees),
+            ("相对角度 / 有效扫转角", self.action_rotation_degrees),
             ("控制器速度比例", self.action_velocity),
             ("动作超时", self.action_timeout),
         )
@@ -565,72 +664,73 @@ class QuickCalWindow(QMainWindow):
         tool_layout.addLayout(tool_actions)
         layout.addWidget(tool_group)
 
-        motion_group = QGroupBox("末端绝对位姿（当前 User / Tool）")
+        motion_group = QGroupBox("TCP 绝对目标")
+        motion_group.setMinimumHeight(160)
         motion_layout = QVBoxLayout(motion_group)
-        motion_layout.setContentsMargins(14, 16, 14, 14)
-        motion_layout.setSpacing(10)
-        motion_header = QHBoxLayout()
-        self.tool_motion_feedback = QLabel("等待机械臂实时反馈")
-        self.tool_motion_feedback.setWordWrap(True)
-        motion_header.addWidget(self.tool_motion_feedback, 1)
-        self.load_current_pose_button = QPushButton("读取当前位姿")
-        self.load_current_pose_button.setProperty("secondary", True)
-        motion_header.addWidget(self.load_current_pose_button)
-        motion_header.addWidget(QLabel("速度比例"))
-        self.manual_motion_velocity = QSpinBox()
-        self.manual_motion_velocity.setRange(1, 80)
-        self.manual_motion_velocity.setValue(20)
-        self.manual_motion_velocity.setSuffix(" %")
-        self.manual_motion_velocity.setMinimumWidth(100)
-        motion_header.addWidget(self.manual_motion_velocity)
-        motion_layout.addLayout(motion_header)
+        motion_layout.setContentsMargins(14, 14, 14, 12)
+        motion_layout.setSpacing(7)
 
-        translation_grid = QGridLayout()
-        translation_grid.setHorizontalSpacing(10)
-        translation_grid.addWidget(QLabel("绝对坐标"), 0, 0)
+        pose_grid = QGridLayout()
+        pose_grid.setHorizontalSpacing(12)
+        pose_grid.setVerticalSpacing(8)
         self.manual_position_spins: dict[str, QDoubleSpinBox] = {}
-        for column, name in enumerate(("X", "Y", "Z"), 1):
+        for column, name in enumerate(("X", "Y", "Z")):
             spin = QDoubleSpinBox()
             spin.setDecimals(2)
             spin.setRange(-2000.0, 2000.0)
             spin.setSingleStep(1.0)
+            spin.setPrefix(f"{name}  ")
             spin.setSuffix(" mm")
+            spin.setMinimumWidth(120)
+            spin.setMinimumHeight(30)
             self.manual_position_spins[name] = spin
-            translation_grid.addWidget(QLabel(name), 0, column)
-            translation_grid.addWidget(spin, 1, column)
-            translation_grid.setColumnStretch(column, 1)
-        self.execute_translation_button = QPushButton("移动到绝对坐标")
-        translation_grid.addWidget(self.execute_translation_button, 1, 4)
-        motion_layout.addLayout(translation_grid)
-
-        rotation_grid = QGridLayout()
-        rotation_grid.setHorizontalSpacing(10)
-        rotation_grid.addWidget(QLabel("绝对角度"), 0, 0)
+            pose_grid.addWidget(spin, 0, column)
+            pose_grid.setColumnStretch(column, 1)
         self.manual_rotation_spins: dict[str, QDoubleSpinBox] = {}
-        for column, name in enumerate(("Rx", "Ry", "Rz"), 1):
+        for column, name in enumerate(("Rx", "Ry", "Rz"), 3):
             spin = QDoubleSpinBox()
             spin.setDecimals(2)
             spin.setRange(-180.0, 180.0)
             spin.setSingleStep(1.0)
+            spin.setPrefix(f"{name}  ")
             spin.setSuffix(" °")
+            spin.setMinimumWidth(120)
+            spin.setMinimumHeight(30)
             self.manual_rotation_spins[name] = spin
-            rotation_grid.addWidget(QLabel(name), 0, column)
-            rotation_grid.addWidget(spin, 1, column)
-            rotation_grid.setColumnStretch(column, 1)
-        self.execute_rotation_button = QPushButton("旋转到绝对角度")
-        rotation_grid.addWidget(self.execute_rotation_button, 1, 4)
-        motion_layout.addLayout(rotation_grid)
+            pose_grid.addWidget(spin, 0, column)
+            pose_grid.setColumnStretch(column, 1)
+        self.execute_translation_button = QPushButton("仅移动位置")
+        self.execute_rotation_button = QPushButton("仅旋转姿态")
+        motion_layout.addLayout(pose_grid)
 
-        note = QLabel(
-            "输入值是当前 User 坐标系下的绝对 TCP 目标，当前 Tool 补偿保持生效。"
-            "位置运动保留实时反馈的 Rx/Ry/Rz；角度运动保留实时反馈的 X/Y/Z。"
-            "每次运动前显示完整目标位姿并再次确认；标定会话运行期间禁止手动运动。"
+        motion_actions = QHBoxLayout()
+        motion_actions.setSpacing(8)
+        self.tool_motion_feedback = QLabel("等待反馈")
+        self.tool_motion_feedback.setMinimumWidth(90)
+        motion_actions.addWidget(self.tool_motion_feedback)
+        motion_actions.addStretch(1)
+        self.load_current_pose_button = QPushButton("读取当前位姿")
+        self.load_current_pose_button.setProperty("secondary", True)
+        motion_actions.addWidget(self.load_current_pose_button)
+        motion_actions.addWidget(QLabel("速度"))
+        self.manual_motion_velocity = QSpinBox()
+        self.manual_motion_velocity.setRange(1, 100)
+        self.manual_motion_velocity.setValue(20)
+        self.manual_motion_velocity.setSuffix(" %")
+        self.manual_motion_velocity.setMinimumWidth(90)
+        motion_actions.addWidget(self.manual_motion_velocity)
+        motion_actions.addWidget(self.execute_translation_button)
+        motion_actions.addWidget(self.execute_rotation_button)
+        motion_layout.addLayout(motion_actions)
+
+        self.manual_motion_result = QLabel(
+            "绝对目标：位置按钮保留当前姿态，姿态按钮保留当前位置；Tool 补偿生效。"
         )
-        note.setWordWrap(True)
-        note.setStyleSheet(
-            "background:#f8fafc;border:1px solid #cbd5e1;border-radius:6px;padding:9px;color:#475467;"
+        self.manual_motion_result.setWordWrap(False)
+        self.manual_motion_result.setStyleSheet(
+            "background:#f8fafc;border:1px solid #cbd5e1;border-radius:6px;padding:7px;color:#475467;"
         )
-        motion_layout.addWidget(note)
+        motion_layout.addWidget(self.manual_motion_result)
         layout.addWidget(motion_group)
         layout.addStretch(1)
         return page
@@ -646,7 +746,7 @@ class QuickCalWindow(QMainWindow):
         self.capture_progress = QProgressBar()
         self.capture_progress.setRange(0, 100)
         self.capture_progress.setFormat("等待开始")
-        self.start_button = QPushButton("开始工厂会话")
+        self.start_button = QPushButton("开始全自动校准")
         self.start_button.setProperty("success", True)
         self.confirm_button = QPushButton("动作条件已满足，开始采集")
         self.abort_button = QPushButton("停止并放弃")
@@ -975,7 +1075,153 @@ class QuickCalWindow(QMainWindow):
         self._manual_absolute_pose_initialized = True
         self._manual_absolute_pose_frame = (int(state.user), int(state.tool))
 
+    def _set_manual_motion_result(self, message: str, level: str = "idle") -> None:
+        colors = {
+            "idle": ("#f8fafc", "#cbd5e1", "#475467"),
+            "info": ("#eff6ff", "#93c5fd", "#1d4ed8"),
+            "good": ("#ecfdf3", "#86efac", "#027a48"),
+            "error": ("#fff1f2", "#fda4af", "#b42318"),
+        }
+        background, border, foreground = colors[level]
+        self.manual_motion_result.setText(message)
+        self.manual_motion_result.setStyleSheet(
+            f"background:{background};border:1px solid {border};border-radius:6px;"
+            f"padding:7px;color:{foreground};font-weight:600;"
+        )
+
+    @classmethod
+    def _manual_target_errors(
+        cls, target_pose, actual_pose
+    ) -> tuple[float, float]:
+        position_error = max(
+            abs(float(target) - float(actual))
+            for target, actual in zip(target_pose[:3], actual_pose[:3])
+        )
+        target_axes = QuickCalCoordinator._tool_axes(target_pose)
+        actual_axes = QuickCalCoordinator._tool_axes(actual_pose)
+        trace = sum(
+            sum(a * b for a, b in zip(target_axis, actual_axis))
+            for target_axis, actual_axis in zip(target_axes, actual_axes)
+        )
+        cosine = max(-1.0, min(1.0, (trace - 1.0) / 2.0))
+        angle_error = math.degrees(math.acos(cosine))
+        return position_error, angle_error
+
+    def _finish_manual_motion(self, message: str, level: str) -> None:
+        self._manual_motion_target = None
+        self._manual_motion_frame = None
+        self._manual_motion_kind = ""
+        self._manual_motion_started_ns = 0
+        self._manual_motion_stable_since_ns = 0
+        self._manual_motion_seen_motion = False
+        self._set_manual_motion_result(message, level)
+        self._append_log(message, level)
+        self._update_action_controls()
+
+    def _update_manual_motion_result(self, state) -> None:
+        target = self._manual_motion_target
+        if target is None:
+            return
+        now = time.monotonic_ns()
+        position_error, angle_error = self._manual_target_errors(target, state.pose)
+        error_detail = (
+            f"位置误差 {position_error:.2f} mm，角度误差 {angle_error:.2f}°"
+        )
+        if (int(state.user), int(state.tool)) != self._manual_motion_frame:
+            self._finish_manual_motion(
+                "手动运动失败：运动期间 User/Tool 发生变化", "error"
+            )
+            return
+        if state.mode == 9:
+            self._finish_manual_motion("手动运动失败：机械臂进入报警状态", "error")
+            return
+        if state.mode == 11:
+            self._finish_manual_motion("手动运动失败：机械臂触发碰撞检测", "error")
+            return
+        if not self._robot_mode_is_enabled(state.mode):
+            self._finish_manual_motion(
+                f"手动运动失败：机械臂已退出使能状态（mode={state.mode}）",
+                "error",
+            )
+            return
+        if now - self._manual_motion_started_ns > MANUAL_MOTION_TIMEOUT_NS:
+            self._finish_manual_motion(
+                f"手动运动超时：{error_detail}", "error"
+            )
+            return
+        moving = bool(
+            state.mode in (7, 8)
+            or state.linear_speed_norm > 1.0
+            or state.angular_speed_norm > 0.8
+        )
+        if moving:
+            self._manual_motion_seen_motion = True
+            self._manual_motion_stable_since_ns = 0
+            self._set_manual_motion_result(
+                f"{self._manual_motion_kind}执行中｜{error_detail}", "info"
+            )
+            return
+        if state.mode != 5:
+            self._manual_motion_stable_since_ns = 0
+            self._set_manual_motion_result(
+                f"等待机械臂恢复空闲（mode={state.mode}）", "info"
+            )
+            return
+        elapsed_ns = now - self._manual_motion_started_ns
+        if (
+            not self._manual_motion_seen_motion
+            and elapsed_ns < MANUAL_MOTION_START_GRACE_NS
+        ):
+            self._set_manual_motion_result("命令已接受，等待机械臂开始运动", "info")
+            return
+        if self._manual_motion_stable_since_ns == 0:
+            self._manual_motion_stable_since_ns = now
+            self._set_manual_motion_result(
+                f"机械臂已停止，正在确认到位｜{error_detail}", "info"
+            )
+            return
+        if now - self._manual_motion_stable_since_ns < MANUAL_MOTION_STABLE_NS:
+            return
+        if (
+            position_error <= MANUAL_POSITION_TOLERANCE_MM
+            and angle_error <= MANUAL_ANGLE_TOLERANCE_DEG
+        ):
+            self._finish_manual_motion(
+                f"{self._manual_motion_kind}完成｜{error_detail}", "good"
+            )
+        else:
+            self._finish_manual_motion(
+                f"{self._manual_motion_kind}失败：机械臂已停止但未到达目标｜{error_detail}",
+                "error",
+            )
+
+    def _check_manual_motion_watchdog(self, now: int) -> None:
+        target = self._manual_motion_target
+        if target is None:
+            return
+        state = self.robot.latest_state
+        if (
+            state is None
+            or now - state.received_monotonic_ns > self.coordinator.ROBOT_FRESH_NS
+        ):
+            self._finish_manual_motion(
+                "手动运动失败：机械臂实时反馈中断", "error"
+            )
+            return
+        if now - self._manual_motion_started_ns > MANUAL_MOTION_TIMEOUT_NS:
+            position_error, angle_error = self._manual_target_errors(
+                target, state.pose
+            )
+            self._finish_manual_motion(
+                "手动运动超时："
+                f"位置误差 {position_error:.2f} mm，角度误差 {angle_error:.2f}°",
+                "error",
+            )
+
     def _execute_manual_absolute_motion(self, kind: str) -> None:
+        if self._manual_motion_target is not None:
+            self._show_error("上一条手动运动仍在等待结果", False)
+            return
         if not self._manual_robot_ready("手动控制末端运动"):
             return
         if not self._manual_absolute_pose_initialized:
@@ -1025,21 +1271,40 @@ class QuickCalWindow(QMainWindow):
         if self.robot.move_pose_l(
             target_pose, velocity, user=state.user, tool=state.tool
         ):
+            self._manual_motion_target = tuple(float(value) for value in target_pose)
+            self._manual_motion_frame = (int(state.user), int(state.tool))
+            self._manual_motion_kind = "位置运动" if kind == "position" else "姿态运动"
+            self._manual_motion_started_ns = time.monotonic_ns()
+            self._manual_motion_stable_since_ns = 0
+            self._manual_motion_seen_motion = False
+            self._set_manual_motion_result("命令已接受，等待机械臂开始运动", "info")
             self._append_log(
                 f"末端绝对运动已发送：User {state.user} / Tool {state.tool}，"
                 f"target=({target_values})，v={velocity}%",
                 "info",
             )
+            self._update_action_controls()
+        else:
+            self._set_manual_motion_result("手动运动命令发送失败", "error")
 
     def _action_config_from_ui(self, silent: bool = False) -> RobotActionConfig | None:
         try:
-            return RobotActionConfig(
+            config = RobotActionConfig(
                 enabled=self.action_auto_enabled.isChecked(),
                 axis=self.action_rotation_axis.currentText(),
                 degrees=self.action_rotation_degrees.value(),
                 velocity_percent=self.action_velocity.value(),
                 timeout_s=self.action_timeout.value(),
             )
+            step_id = self.action_step_combo.currentText()
+            if step_id in GYRO_AUTO_STEPS:
+                expected_sweep = 90.0 if step_id in GYRO_LIMITED_STEPS else 150.0
+                if not math.isclose(abs(config.degrees), expected_sweep, abs_tol=1e-6):
+                    raise ValueError(
+                        f"{step_id} 有效扫转角绝对值必须为 {expected_sweep:.0f}°；"
+                        "只可通过正负号修改方向"
+                    )
+            return config
         except ValueError as exc:
             if not silent:
                 self._show_error(str(exc), True)
@@ -1060,11 +1325,18 @@ class QuickCalWindow(QMainWindow):
             return
         self.robot_actions = actions
         self._refresh_action_preview()
-        self._append_log(
-            f"已保存 {step_id}：Tool {config.axis} {config.degrees:+.2f}°，"
-            f"速度 {config.velocity_percent}%",
-            "good",
-        )
+        if step_id in GYRO_AUTO_STEPS:
+            self._append_log(
+                f"已保存 {step_id}：Tool {config.axis}，有效扫转 "
+                f"{config.degrees:+.0f}°，固定 15°/s",
+                "good",
+            )
+        else:
+            self._append_log(
+                f"已保存 {step_id}：Tool {config.axis} {config.degrees:+.2f}°，"
+                f"速度 {config.velocity_percent}%",
+                "good",
+            )
 
     @Slot(str)
     def _load_selected_action_config(self, step_id: str) -> None:
@@ -1079,12 +1351,29 @@ class QuickCalWindow(QMainWindow):
             self.action_velocity.setValue(config.velocity_percent)
             self.action_timeout.setValue(config.timeout_s)
             self.save_action_config_button.setText(f"保存 {step_id} 配置")
+            is_gyro = step_id in GYRO_AUTO_STEPS
+            self.action_rotation_degrees.setToolTip(
+                "G 阶段绝对值由 r024 固定，只能修改正负号来改变方向"
+                if is_gyro
+                else "相对于当前 Tool 坐标系的旋转角度"
+            )
+            fixed_hint = "G 阶段速度固定为 15°/s，由点动速度标定自动换算"
+            self.action_velocity.setToolTip(fixed_hint if is_gyro else "控制器速度比例")
+            self.action_timeout.setToolTip(
+                "G 阶段使用自动扫转安全超时" if is_gyro else "相对旋转动作超时"
+            )
+            editable = self._auto_action_step is None
+            self.action_velocity.setEnabled(editable and not is_gyro)
+            self.action_timeout.setEnabled(editable and not is_gyro)
         finally:
             self._building_action_config = False
         self._refresh_action_preview()
 
     def _config_for_step(self, step_id: str) -> RobotActionConfig | None:
-        if self.action_step_combo.currentText() == step_id:
+        if (
+            hasattr(self, "action_step_combo")
+            and self.action_step_combo.currentText() == step_id
+        ):
             return self._action_config_from_ui(silent=True)
         return self.robot_actions.get(step_id)
 
@@ -1096,6 +1385,19 @@ class QuickCalWindow(QMainWindow):
         config = self._action_config_from_ui(silent=True)
         if config is None:
             self.action_prediction.setText(f"{step_id} 配置无效")
+            return
+        if step_id in GYRO_AUTO_STEPS:
+            direction = "+" if config.degrees > 0 else "-"
+            outer = LIMITED_GYRO_OUTER_DEG if step_id in GYRO_LIMITED_STEPS else 85.0
+            bound = LIMITED_GYRO_CAPTURE_BOUND_DEG if step_id in GYRO_LIMITED_STEPS else 75.0
+            self.action_prediction.setText(
+                f"{step_id} 协议阶段保持不变；机械臂映射为 Tool {config.axis}{direction}。\n"
+                f"预置到 {-math.copysign(outer, config.degrees):+.1f}°，"
+                f"仅在 {-math.copysign(bound, config.degrees):+.1f}° → "
+                f"{math.copysign(bound, config.degrees):+.1f}° 以 "
+                f"{math.copysign(ROLL_PITCH_GYRO_RATE_DEG_S, config.degrees):+.1f}°/s 采集。\n"
+                "角度绝对值由 r024 锁定；修改正负号只改变扫转方向。"
+            )
             return
         state = self.robot.latest_state
         if state is None:
@@ -1125,14 +1427,117 @@ class QuickCalWindow(QMainWindow):
     @Slot()
     def _confirm_or_execute_current_action(self) -> None:
         step_id = self.coordinator.current_step.step_id
-        if step_id == "G01":
-            self._start_g01_auto_action()
+        if step_id in GYRO_AUTO_STEPS:
+            self._start_gyro_x_auto_action(step_id)
+            return
+        if step_id in MAG_AUTO_STEPS:
+            self._start_mag_auto_action(step_id)
             return
         config = self._config_for_step(step_id)
         if step_id in self.robot_actions and config is not None and config.enabled:
             self._start_accel_auto_action(step_id, config)
             return
         self.coordinator.confirm_current_action()
+
+    def _try_start_full_auto_step(self) -> None:
+        if not self._full_auto_enabled or not self.coordinator.running:
+            return
+        if (
+            self.coordinator.state != RunState.READY
+            or self._auto_action_step is not None
+        ):
+            return
+        step_id = self.coordinator.current_step.step_id
+        if step_id == "P1":
+            # P1 has its own continuous two-second stillness gate in the coordinator.
+            return
+        if step_id in ("A01", "A02", "A03", "A04", "A05", "A06"):
+            config = self._config_for_step(step_id)
+            if config is None or not config.enabled:
+                self._show_error(
+                    f"全自动流程无法执行 {step_id}：该步骤的机械臂自动动作未启用",
+                    True,
+                )
+                return
+            self._start_accel_auto_action(step_id, config)
+            return
+        if step_id in GYRO_AUTO_STEPS:
+            self._start_gyro_x_auto_action(step_id)
+            return
+        if step_id in MAG_AUTO_STEPS:
+            self._start_mag_auto_action(step_id)
+            return
+        if step_id == "S02" and not self._update_full_auto_safe_return():
+            return
+        if step_id in ("S01", "S02"):
+            # Wait here rather than emitting repeated condition errors while the
+            # previous robot action is returning to neutral.
+            if self.coordinator._check_motion_condition(
+                self.coordinator.current_step
+            ):
+                return
+            self.coordinator.confirm_current_action()
+
+    def _update_full_auto_safe_return(self) -> bool:
+        taught = self.taught_poses.get("safe")
+        if taught is None:
+            self._show_error("全自动收尾失败：尚未示教安全位", True)
+            return False
+        state = self.robot.latest_state
+        now = time.monotonic_ns()
+        if (
+            not self.robot.connected
+            or state is None
+            or now - state.received_monotonic_ns >= 1_000_000_000
+        ):
+            self._show_error("全自动回安全位失败：机械臂未连接或反馈超时", True)
+            return False
+        if (
+            self._at_taught_pose(taught)
+            and state.mode == 5
+            and state.linear_speed_norm <= 1.0
+            and state.angular_speed_norm <= 0.8
+        ):
+            self._full_auto_safe_return_started_ns = 0
+            self._full_auto_safe_return_seen_motion = False
+            return True
+        if self._full_auto_safe_return_started_ns == 0:
+            if (
+                state.mode != 5
+                or state.linear_speed_norm > 1.0
+                or state.angular_speed_norm > 0.8
+            ):
+                return False
+            if not self.robot.activate_frames(taught.user, taught.tool):
+                self._show_error("全自动回安全位失败：User/Tool 启用失败", True)
+                return False
+            command_ok = (
+                self.robot.move_joints(taught.joints, 15)
+                if taught.joints
+                else self.robot.move_pose_j(
+                    taught.pose, 15, taught.user, taught.tool
+                )
+            )
+            if not command_ok:
+                self._show_error("全自动回安全位命令发送失败", True)
+                return False
+            self._full_auto_safe_return_started_ns = now
+            self._full_auto_safe_return_seen_motion = False
+            self._append_log("S02 开始以 15% 速度自动返回示教安全位", "info")
+            return False
+        elapsed_ns = now - self._full_auto_safe_return_started_ns
+        if elapsed_ns > 90_000_000_000:
+            self._show_error("全自动回安全位等待到位超时", True)
+            return False
+        if state.mode in (7, 8) or state.linear_speed_norm > 1.0 or state.angular_speed_norm > 0.8:
+            self._full_auto_safe_return_seen_motion = True
+            return False
+        if state.mode != 5:
+            return False
+        if not self._full_auto_safe_return_seen_motion and elapsed_ns < 3_000_000_000:
+            return False
+        self._show_error("机械臂已停止，但没有到达示教安全位", True)
+        return False
 
     def _start_accel_auto_action(
         self, step_id: str, config: RobotActionConfig
@@ -1191,7 +1596,13 @@ class QuickCalWindow(QMainWindow):
                 f"控制器命令分为 {segments} 段，预计到位偏差 {predicted_angle:.2f}°。\n\n"
                 "请确认整条旋转路径无碰撞、线束无拉扯，人员已离开运动区域。"
             )
-            if QMessageBox.question(self, f"确认执行 {step_id} 自动旋转", message) != QMessageBox.StandardButton.Yes:
+            if (
+                not self._full_auto_enabled
+                and QMessageBox.question(
+                    self, f"确认执行 {step_id} 自动旋转", message
+                )
+                != QMessageBox.StandardButton.Yes
+            ):
                 return
 
         now = time.monotonic_ns()
@@ -1230,6 +1641,10 @@ class QuickCalWindow(QMainWindow):
         self._auto_action_seen_motion = False
         self._append_log(message, level)
         self._update_action_controls()
+        if level == "error" and self._full_auto_enabled:
+            self._stop_full_auto(message, abort=True)
+        elif self._full_auto_enabled:
+            QTimer.singleShot(0, self._try_start_full_auto_step)
 
     def _check_auto_action_timeout(self, now_ns: int | None = None) -> None:
         if self._auto_action_step is None:
@@ -1237,8 +1652,11 @@ class QuickCalWindow(QMainWindow):
         now_ns = time.monotonic_ns() if now_ns is None else now_ns
         if self._auto_action_deadline_ns and now_ns > self._auto_action_deadline_ns:
             step_id = self._auto_action_step
-            if step_id == "G01":
-                self._fail_g01_auto_action("G01 自动动作超时")
+            if step_id in GYRO_AUTO_STEPS:
+                self._fail_gyro_x_auto_action(f"{step_id} 自动动作超时")
+                return
+            if step_id in MAG_AUTO_STEPS:
+                self._fail_mag_auto_action(f"{step_id} 自动磁工单动作超时")
                 return
             self.robot.stop()
             self._finish_auto_action(f"{step_id} 自动旋转等待到位超时，已停止机械臂", "error")
@@ -1249,51 +1667,110 @@ class QuickCalWindow(QMainWindow):
         percent = value if value > 1.5 else value * 100.0
         return max(1, min(100, round(percent)))
 
-    def _g01_jog_speed_factor(self, tool: int) -> tuple[int, str]:
+    def _gyro_motion_parameters(
+        self, step_id: str
+    ) -> tuple[str, float, float, float]:
+        config = self._config_for_step(step_id)
+        if config is None or not config.enabled:
+            raise ValueError(f"{step_id} 机械臂自动动作未启用")
+        expected_sweep = 90.0 if step_id in GYRO_LIMITED_STEPS else 150.0
+        if not math.isclose(abs(config.degrees), expected_sweep, abs_tol=1e-6):
+            raise ValueError(f"{step_id} 有效扫转角必须为 ±{expected_sweep:.0f}°")
+        if step_id in GYRO_LIMITED_STEPS and not self.coordinator.limits.valid:
+            raise ValueError("G01/G02 固定运动参数不是 ±55°/±45°、15°/s、6 s")
+        direction = 1.0 if config.degrees > 0 else -1.0
+        outer = LIMITED_GYRO_OUTER_DEG if step_id in GYRO_LIMITED_STEPS else 85.0
+        capture_bound = (
+            LIMITED_GYRO_CAPTURE_BOUND_DEG if step_id in GYRO_LIMITED_STEPS else 75.0
+        )
+        return (
+            config.axis,
+            -direction * outer,
+            -direction * capture_bound,
+            direction * ROLL_PITCH_GYRO_RATE_DEG_S,
+        )
+
+    def _gyro_decel_endpoint(self, step_id: str) -> float:
+        """Return the opposite outer endpoint, outside the fitted capture window."""
+        _axis, lead_in, _capture_start, _target_rate = (
+            self._gyro_motion_parameters(step_id)
+        )
+        return -lead_in
+
+    def _gyro_jog_speed_factor(
+        self, axis: str, target_rate: float, tool: int
+    ) -> tuple[int, str]:
         full_speed_deg_s = 0.0
         source = "保守估算"
         try:
             data = json.loads(ROTATION_SPEED_CALIBRATION_FILE.read_text(encoding="utf-8"))
             profiles = data.get("profiles", {})
-            jog_profile = profiles.get(f"jog_tool_{int(tool)}_Rx", {})
+            jog_profile = profiles.get(f"jog_tool_{int(tool)}_{axis}", {})
             full_speed_deg_s = float(
                 jog_profile.get("full_global_speed_deg_s", 0.0) or 0.0
             )
             if full_speed_deg_s > 0.0:
-                source = "Tool Rx 点动标定"
+                source = f"Tool {axis} 点动标定"
             else:
-                relative_profile = profiles.get(f"tool_{int(tool)}_Rx", {})
+                relative_profile = profiles.get(f"tool_{int(tool)}_{axis}", {})
                 rate = float(
                     relative_profile.get("deg_s_per_v_at_full_global", 0.0) or 0.0
                 )
                 if rate > 0.0:
                     full_speed_deg_s = rate * 100.0
-                    source = "Tool Rx 相对运动标定"
+                    source = f"Tool {axis} 相对运动标定"
         except (OSError, ValueError, TypeError):
             full_speed_deg_s = 0.0
         if not math.isfinite(full_speed_deg_s) or full_speed_deg_s <= 0.0:
             full_speed_deg_s = 100.0
-        factor = round(G01_TARGET_RATE_DEG_S / full_speed_deg_s * 100.0)
-        return max(1, min(80, factor)), source
+        factor = round(abs(target_rate) / full_speed_deg_s * 100.0)
+        return max(1, min(100, factor)), source
 
-    def _relative_tool_rx_deg(
+    def _relative_tool_axis_deg(
+        self,
+        reference_pose: tuple[float, ...],
+        current_pose: tuple[float, ...],
+        axis: str,
+    ) -> float:
+        reference_axes = self.coordinator._tool_axes(reference_pose)
+        current_axes = self.coordinator._tool_axes(current_pose)
+        if axis == "Rx":
+            cosine = sum(a * b for a, b in zip(reference_axes[1], current_axes[1]))
+            sine = sum(a * b for a, b in zip(reference_axes[2], current_axes[1]))
+        elif axis == "Ry":
+            cosine = sum(a * b for a, b in zip(reference_axes[0], current_axes[0]))
+            sine = sum(a * b for a, b in zip(reference_axes[0], current_axes[2]))
+        elif axis == "Rz":
+            cosine = sum(a * b for a, b in zip(reference_axes[0], current_axes[0]))
+            sine = sum(a * b for a, b in zip(reference_axes[1], current_axes[0]))
+        else:
+            raise ValueError(f"不支持的 Tool 相对旋转轴：{axis}")
+        return math.degrees(math.atan2(sine, cosine))
+
+    def _orientation_error_deg(
         self, reference_pose: tuple[float, ...], current_pose: tuple[float, ...]
     ) -> float:
         reference_axes = self.coordinator._tool_axes(reference_pose)
         current_axes = self.coordinator._tool_axes(current_pose)
-        cosine = sum(a * b for a, b in zip(reference_axes[1], current_axes[1]))
-        sine = sum(a * b for a, b in zip(reference_axes[2], current_axes[1]))
-        return math.degrees(math.atan2(sine, cosine))
+        trace = sum(
+            sum(a * b for a, b in zip(reference_axis, current_axis))
+            for reference_axis, current_axis in zip(reference_axes, current_axes)
+        )
+        cosine = max(-1.0, min(1.0, (trace - 1.0) / 2.0))
+        return math.degrees(math.acos(cosine))
 
-    def _start_g01_auto_action(self) -> None:
+    def _start_gyro_x_auto_action(self, step_id: str) -> None:
+        if step_id not in GYRO_AUTO_STEPS:
+            self._show_error(f"不支持的自动陀螺步骤：{step_id}", True)
+            return
         if self._auto_action_step is not None:
             self._show_error("机械臂自动动作已经在执行", False)
             return
         if (
             self.coordinator.state != RunState.READY
-            or self.coordinator.current_step.step_id != "G01"
+            or self.coordinator.current_step.step_id != step_id
         ):
-            self._show_error("只有在 G01 等待动作条件时才能执行自动扫转", False)
+            self._show_error(f"只有在 {step_id} 等待动作条件时才能执行自动扫转", False)
             return
         state = self.robot.latest_state
         if (
@@ -1306,86 +1783,287 @@ class QuickCalWindow(QMainWindow):
             return
         neutral = self.taught_poses.get("neutral")
         if neutral is None or state.user != neutral.user or state.tool != neutral.tool:
-            self._show_error("当前 User/Tool 与示教标定中位不一致，禁止执行 G01", True)
-            return
-        alignment = self.coordinator._accel_face_alignment("A06", state.pose)
-        if alignment is None or alignment[0] > self.coordinator.ACCEL_FACE_MAX_DEG:
-            detail = "无法计算当前姿态" if alignment is None else f"当前 -Z 偏差 {alignment[0]:.2f}°"
-            self._show_error(f"G01 必须从 A06 完成姿态开始；{detail}", True)
-            return
-        predicted = gravity_after_tool_rotation(
-            alignment[1], "Rx", G01_RESTORE_DEG
-        )
-        restore_error = vector_angle_deg(predicted, (0.0, -1.0, 0.0))
-        if restore_error > self.coordinator.ACCEL_FACE_MAX_DEG:
             self._show_error(
-                f"Rx +90° 复原后预计 -Y 偏差 {restore_error:.2f}°，已禁止下发",
-                True,
+                f"当前 User/Tool 与示教标定中位不一致，禁止执行 {step_id}", True
             )
             return
-        message = (
-            "G01 将自动执行以下动作：\n"
-            "1. Tool Rx +90°，撤销 A05/A06 的净 Rx 动作并回到 -Y 基准；\n"
-            "2. Tool Rx -85°，作为加速引入区；\n"
-            "3. Tool Rx+ 连续点动，实测经过 -75°且稳定在 +15±3°/s 时开启 10 秒采集；\n"
-            "4. 采集结束停止点动，并自动回到 G01 的 X 中位。\n\n"
-            "请确认完整路径无碰撞、线束无拉扯，人员已离开运动区域。"
-        )
-        if QMessageBox.question(self, "确认执行 G01 自动扫转", message) != QMessageBox.StandardButton.Yes:
+        try:
+            axis, lead_in, capture_start, target_rate = self._gyro_motion_parameters(
+                step_id
+            )
+        except (KeyError, ValueError) as exc:
+            self._show_error(f"{step_id} 自动动作参数无效：{exc}", True)
+            return
+        decel_end = self._gyro_decel_endpoint(step_id)
+
+        if step_id == "G01":
+            alignment = self.coordinator._accel_face_alignment("A06", state.pose)
+            if alignment is None or alignment[0] > self.coordinator.ACCEL_FACE_MAX_DEG:
+                detail = (
+                    "无法计算当前姿态"
+                    if alignment is None
+                    else f"当前 -Z 偏差 {alignment[0]:.2f}°"
+                )
+                self._show_error(f"G01 必须从 A06 完成姿态开始；{detail}", True)
+                return
+            after_rx = gravity_after_tool_rotation(
+                alignment[1], "Rx", G01_RESTORE_RX_DEG
+            )
+            rx_restore_error = vector_angle_deg(after_rx, (0.0, -1.0, 0.0))
+            if rx_restore_error > self.coordinator.ACCEL_FACE_MAX_DEG:
+                self._show_error(
+                    f"G01 基准姿态预测未通过：Rx 复原后 -Y 偏差 "
+                    f"{rx_restore_error:.2f}°",
+                    True,
+                )
+                return
+            message = (
+                "G01 将自动执行以下动作：\n"
+                "1. Tool Rx +90°，撤销 A05/A06 的净 Rx 动作并回到 -Y；\n"
+                "2. 以 -Y 姿态作为 G01/G02 的 Rx 零位，使重力与 Rx 垂直；\n"
+                f"3. Tool {axis} {lead_in:+.1f}°，作为加速引入区；\n"
+                f"4. Tool {axis}{'+' if target_rate > 0 else '-'} 点动，"
+                f"经过 {capture_start:+.1f}°且稳定在 "
+                f"{target_rate:+.1f}±{max(GYRO_RATE_TOLERANCE_DEG_S, abs(target_rate) * 0.2):.1f}°/s "
+                f"时开启 {self.coordinator.current_step.capture_s:.2f} 秒采集，"
+                f"预计到达 {-capture_start:+.1f}°；\n"
+                f"5. 关闭采集后在减速区到达 Tool {axis} {decel_end:+.1f}°，"
+                "再回到 G01/G02 共用的 -Y 基准。\n\n"
+                "请确认完整路径无碰撞、线束无拉扯，人员已离开运动区域。"
+            )
+        else:
+            if step_id == "G02":
+                alignment = self.coordinator._accel_face_alignment("A04", state.pose)
+                if alignment is None or alignment[0] > self.coordinator.ACCEL_FACE_MAX_DEG:
+                    error = math.inf if alignment is None else alignment[0]
+                    self._show_error(
+                        f"G02 必须从 G01 返回的 -Y 基准开始；当前偏差 {error:.2f}°",
+                        True,
+                    )
+                    return
+            neutral_error = self._orientation_error_deg(neutral.pose, state.pose)
+            neutral_tolerance = (
+                2.0
+                if step_id in GYRO_LIMITED_STEPS
+                else self.coordinator.ACCEL_FACE_MAX_DEG
+            )
+            if step_id != "G02" and neutral_error > neutral_tolerance:
+                self._show_error(
+                    f"{step_id} 必须从上一步回到标定中位后开始；"
+                    f"当前与示教中位的三维姿态偏差 {neutral_error:.2f}°，"
+                    f"允许 {neutral_tolerance:.1f}°",
+                    True,
+                )
+                return
+            direction = "+" if target_rate > 0 else "-"
+            if step_id in GYRO_LIMITED_STEPS:
+                limits = self.coordinator.limits
+                capture_end = (
+                    limits.positive_safe_deg
+                    if target_rate > 0
+                    else limits.negative_safe_deg
+                )
+                range_detail = (
+                    f"完整行程 {limits.negative_soft_limit_deg:+.1f}°～"
+                    f"{limits.positive_soft_limit_deg:+.1f}°，匀速采集区 "
+                    f"{limits.negative_safe_deg:+.1f}°～{limits.positive_safe_deg:+.1f}°"
+                )
+            else:
+                capture_end = -capture_start
+                range_detail = (
+                    f"匀速采集范围约 {capture_start:+.0f}°～{capture_end:+.0f}°"
+                )
+            message = (
+                f"{step_id} 将自动执行以下动作：\n"
+                f"1. 以当前标定中位为 {axis} 零位，Tool {axis} "
+                f"{lead_in:+.1f}°预置；\n"
+                f"2. Tool {axis}{direction} 点动，经过 {capture_start:+.1f}°且稳定在 "
+                f"{target_rate:+.1f}±{max(GYRO_RATE_TOLERANCE_DEG_S, abs(target_rate) * 0.2):.1f}°/s "
+                f"时开启 {self.coordinator.current_step.capture_s:.2f} 秒采集；\n"
+                f"3. {range_detail}，在 {capture_end:+.1f}°关闭采集；\n"
+                f"4. 在采集窗外减速并到达 {decel_end:+.1f}°，"
+                f"再回到本次 {step_id} 的标定中位。\n\n"
+                "请确认完整路径无碰撞、线束无拉扯，人员已离开运动区域。"
+            )
+        if (
+            not self._full_auto_enabled
+            and QMessageBox.question(
+                self, f"确认执行 {step_id} 自动扫转", message
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
             return
 
         now = time.monotonic_ns()
-        self._auto_action_step = "G01"
+        self._auto_action_step = step_id
         self._auto_action_started_ns = now
-        self._auto_action_deadline_ns = now + int(G01_TIMEOUT_S * 1_000_000_000)
+        timeout_s = max(
+            GYRO_TIMEOUT_S, self.coordinator.current_step.capture_s + 30.0
+        )
+        self._auto_action_deadline_ns = now + int(timeout_s * 1_000_000_000)
         self._auto_action_seen_motion = False
         self._auto_action_stable_since_ns = 0
-        self._g01_phase = "restore"
-        self._g01_phase_started_ns = now
-        self._g01_reference_pose = None
-        self._g01_original_speed_factor = self._speed_factor_percent(state.speed_scaling)
-        self._g01_jog_active = False
-        self.coordinator.recorder.marker(
-            "robot_auto_move_request", "G01", "restore=Rx+90; lead_in=Rx-85; capture=Rx+@15deg/s"
+        self._gyro_x_phase_started_ns = now
+        self._gyro_x_reference_pose = None
+        self._gyro_x_original_speed_factor = self._speed_factor_percent(
+            state.speed_scaling
         )
-        self._append_log(
-            f"G01 开始复原：Tool Rx +{G01_RESTORE_DEG:.1f}°，原全局速度比例 "
-            f"{self._g01_original_speed_factor}%",
-            "info",
-        )
+        self._gyro_x_jog_speed_factor = 0
+        self._gyro_x_decel_level = -1
+        self._gyro_x_jog_active = False
         self._update_action_controls()
-        if not self.robot.relative_tool_rotation("Rx", G01_RESTORE_DEG, 80):
-            self._fail_g01_auto_action("G01 复原命令发送失败")
+        if step_id == "G01":
+            self._gyro_x_phase = "restore_rx"
+            self.coordinator.recorder.marker(
+                "robot_auto_move_request",
+                step_id,
+                f"restore=Rx+90; gravity_base=-Y; lead_in={axis}{lead_in:+.1f}; "
+                f"capture={axis}{'+' if target_rate > 0 else '-'}"
+                f"@{abs(target_rate):.1f}deg/s",
+            )
+            self._append_log(
+                f"G01 开始建立 -Y 重力基准：执行 Tool Rx "
+                f"+{G01_RESTORE_RX_DEG:.1f}°；"
+                f"原全局速度比例 {self._gyro_x_original_speed_factor}%",
+                "info",
+            )
+            if not self.robot.relative_tool_rotation(
+                "Rx", G01_RESTORE_RX_DEG, GYRO_RETURN_SPEED_PERCENT
+            ):
+                self._fail_gyro_x_auto_action("G01 Rx 复原命令发送失败")
+        else:
+            if step_id == "G02":
+                self._gyro_x_reference_pose = tuple(state.pose)
+                self.coordinator.gyro_limited_reference_pose = tuple(state.pose)
+            self.coordinator.recorder.marker(
+                "robot_auto_move_request",
+                step_id,
+                f"lead_in={axis}{lead_in:+.1f}; capture={axis}"
+                f"{'+' if target_rate > 0 else '-'}@{abs(target_rate):.1f}deg/s",
+            )
+            self._begin_gyro_x_preposition(step_id, state, now)
 
-    def _restore_g01_speed_factor(self) -> None:
-        if self._g01_original_speed_factor:
-            self.robot.set_speed_factor(self._g01_original_speed_factor)
-            self._g01_original_speed_factor = 0
+    def _begin_gyro_x_preposition(self, step_id: str, state, now: int) -> None:
+        axis, lead_in, _capture_start, _target_rate = self._gyro_motion_parameters(
+            step_id
+        )
+        if step_id in GYRO_LIMITED_STEPS:
+            if self._gyro_x_reference_pose is None:
+                reference = self.coordinator.gyro_limited_reference_pose
+                if reference is None:
+                    self._fail_gyro_x_auto_action(
+                        f"{step_id} 缺少 G01/G02 共用的 -Y 基准姿态"
+                    )
+                    return
+                self._gyro_x_reference_pose = tuple(reference)
+            current_angle = self._relative_tool_axis_deg(
+                self._gyro_x_reference_pose, state.pose, axis
+            )
+            command_angle = lead_in - current_angle
+            reference_description = (
+                f"-Y 重力基准（当前 {axis} 偏差 {current_angle:+.2f}°，已补偿）"
+            )
+        else:
+            self._gyro_x_reference_pose = tuple(state.pose)
+            command_angle = lead_in
+            reference_description = "当前标定中位"
+        self._gyro_x_phase = "preposition"
+        self._gyro_x_phase_started_ns = now
+        self._auto_action_seen_motion = False
+        self._append_log(
+            f"{step_id} 已使用{reference_description}作为零位，"
+            f"开始 Tool {axis} {command_angle:+.2f}°运动到 {lead_in:+.1f}°加速引入位",
+            "good",
+        )
+        if not self.robot.relative_tool_rotation(
+            axis, command_angle, GYRO_TRANSIT_SPEED_PERCENT
+        ):
+            self._fail_gyro_x_auto_action(f"{step_id} 加速引入预置命令发送失败")
 
-    def _stop_g01_jog(self) -> None:
-        if self._g01_jog_active:
+    def _restore_gyro_x_speed_factor(self) -> None:
+        if self._gyro_x_original_speed_factor:
+            self.robot.set_speed_factor(self._gyro_x_original_speed_factor)
+            self._gyro_x_original_speed_factor = 0
+
+    def _stop_gyro_x_jog(self, *, restore_speed: bool = True) -> None:
+        if self._gyro_x_jog_active:
             self.robot.stop_tool_jog()
-            self._g01_jog_active = False
-        self._restore_g01_speed_factor()
+            self._gyro_x_jog_active = False
+        if restore_speed:
+            self._restore_gyro_x_speed_factor()
 
-    def _fail_g01_auto_action(self, message: str) -> None:
-        self._stop_g01_jog()
+    def _set_gyro_x_decel_level(self, level: int) -> bool:
+        if level <= self._gyro_x_decel_level:
+            return True
+        _threshold, multiplier = GYRO_SMOOTH_DECEL_PROFILE[level]
+        speed_factor = max(1, round(self._gyro_x_jog_speed_factor * multiplier))
+        if not self.robot.set_speed_factor(speed_factor):
+            return False
+        self._gyro_x_decel_level = level
+        return True
+
+    def _fail_gyro_x_auto_action(self, message: str) -> None:
+        self._stop_gyro_x_jog()
         self.robot.stop()
-        self._g01_phase = ""
-        self._g01_reference_pose = None
+        self._gyro_x_phase = ""
+        self._gyro_x_reference_pose = None
         self._finish_auto_action(message, "error")
         if self.coordinator.running:
             self.coordinator.abort(message)
 
-    def _update_g01_auto_action(self, state) -> None:
-        if self._auto_action_step != "G01":
+    def _begin_gyro_x_return(
+        self, step_id: str, axis: str, angle: float, now: int
+    ) -> None:
+        if abs(angle) < 0.5:
+            self._gyro_x_phase = "return"
+            self._gyro_x_phase_started_ns = now - 800_000_000
+            self._auto_action_seen_motion = True
+            return
+        if abs(angle) > 180.0:
+            self._fail_gyro_x_auto_action(
+                f"{step_id} 端点位置无法安全回中：{axis} {angle:+.2f}°"
+            )
+            return
+        self._gyro_x_phase = "return"
+        self._gyro_x_phase_started_ns = now
+        self._auto_action_seen_motion = False
+        self._append_log(
+            f"{step_id} 已完成采集窗外减速区，当前 {axis} {angle:+.2f}°，"
+            "开始回标定中位",
+            "info",
+        )
+        if not self.robot.relative_tool_rotation(
+            axis, -angle, GYRO_RETURN_SPEED_PERCENT
+        ):
+            self._fail_gyro_x_auto_action(f"{step_id} 回标定中位命令发送失败")
+
+    def _update_gyro_x_auto_action(self, state) -> None:
+        step_id = self._auto_action_step
+        if step_id not in GYRO_AUTO_STEPS:
             return
         now = time.monotonic_ns()
         self._check_auto_action_timeout(now)
-        if self._auto_action_step != "G01":
+        if self._auto_action_step != step_id:
             return
-        phase = self._g01_phase
-        if phase in ("restore", "preposition", "return"):
+        try:
+            axis, lead_in, capture_start, target_rate = self._gyro_motion_parameters(
+                step_id
+            )
+        except (KeyError, ValueError) as exc:
+            self._fail_gyro_x_auto_action(f"{step_id} 自动动作参数失效：{exc}")
+            return
+        axis_index = {"Rx": 0, "Ry": 1, "Rz": 2}[axis]
+        rate_tolerance = max(
+            GYRO_RATE_TOLERANCE_DEG_S, abs(target_rate) * 0.2
+        )
+        phase = self._gyro_x_phase
+        if phase in (
+            "restore_rx",
+            "restore_neutral_rz",
+            "preposition",
+            "postposition",
+            "return",
+        ):
             if state.mode in (7, 8) or state.angular_speed_norm > 0.8:
                 self._auto_action_seen_motion = True
                 return
@@ -1393,71 +2071,152 @@ class QuickCalWindow(QMainWindow):
                 return
             if (
                 not self._auto_action_seen_motion
-                and now - self._g01_phase_started_ns < 800_000_000
+                and now - self._gyro_x_phase_started_ns < 800_000_000
             ):
                 return
-            if phase == "restore":
+            if phase == "restore_rx":
                 alignment = self.coordinator._accel_face_alignment("A04", state.pose)
                 if alignment is None or alignment[0] > self.coordinator.ACCEL_FACE_MAX_DEG:
                     error = math.inf if alignment is None else alignment[0]
-                    self._fail_g01_auto_action(f"G01 Rx +90°复原后 -Y 偏差 {error:.2f}°")
-                    return
-                self._g01_reference_pose = tuple(state.pose)
-                self._g01_phase = "preposition"
-                self._g01_phase_started_ns = now
-                self._auto_action_seen_motion = False
-                self._append_log("G01 已恢复 -Y 基准，开始 Rx -85° 加速引入预置", "good")
-                if not self.robot.relative_tool_rotation("Rx", G01_LEAD_IN_DEG, 80):
-                    self._fail_g01_auto_action("G01 加速引入预置命令发送失败")
-                return
-            if self._g01_reference_pose is None:
-                self._fail_g01_auto_action("G01 缺少 X 中位参考姿态")
-                return
-            angle = self._relative_tool_rx_deg(self._g01_reference_pose, state.pose)
-            if phase == "preposition":
-                if abs(angle - G01_LEAD_IN_DEG) > 5.0:
-                    self._fail_g01_auto_action(
-                        f"G01 预置到位角度异常：实测 Rx {angle:+.2f}°"
+                    self._fail_gyro_x_auto_action(
+                        f"G01 Rx +90°复原后 -Y 偏差 {error:.2f}°"
                     )
                     return
-                speed_factor, source = self._g01_jog_speed_factor(state.tool)
-                self._g01_phase = "lead_in"
-                self._g01_phase_started_ns = now
+                self._gyro_x_reference_pose = tuple(state.pose)
+                self.coordinator.gyro_limited_reference_pose = tuple(state.pose)
+                self._append_log(
+                    "G01 已恢复 -Y；保持该姿态作为 G01/G02 共用重力基准", "good"
+                )
+                self._begin_gyro_x_preposition(step_id, state, now)
+                return
+            if phase == "restore_neutral_rz":
+                alignment = self.coordinator._accel_face_alignment("A02", state.pose)
+                if alignment is None or alignment[0] > self.coordinator.ACCEL_FACE_MAX_DEG:
+                    error = math.inf if alignment is None else alignment[0]
+                    self._fail_gyro_x_auto_action(
+                        f"G02 Rz +90°回全局中位后 -X 偏差 {error:.2f}°"
+                    )
+                    return
+                neutral = self.taught_poses.get("neutral")
+                if neutral is None:
+                    self._fail_gyro_x_auto_action("G02 缺少示教标定中位")
+                    return
+                orientation_error = self._orientation_error_deg(
+                    neutral.pose, state.pose
+                )
+                if orientation_error > 2.0:
+                    self._fail_gyro_x_auto_action(
+                        "G02 回全局中位后的重力方向合格，但绕重力轴方向不正确："
+                        f"与示教中位三维姿态偏差 {orientation_error:.2f}°，允许 2.0°"
+                    )
+                    return
+                self.coordinator.gyro_limited_reference_pose = None
+                self._gyro_x_phase = ""
+                self._gyro_x_reference_pose = None
+                self._finish_auto_action(
+                    "G02 已完成采集并从 -Y 基准回到全局 -X 标定中位", "good"
+                )
+                return
+            if self._gyro_x_reference_pose is None:
+                self._fail_gyro_x_auto_action(f"{step_id} 缺少标定中位参考姿态")
+                return
+            angle = self._relative_tool_axis_deg(
+                self._gyro_x_reference_pose, state.pose, axis
+            )
+            if phase == "preposition":
+                if abs(angle - lead_in) > 5.0:
+                    self._fail_gyro_x_auto_action(
+                        f"{step_id} 预置到位角度异常：目标 {lead_in:+.1f}°，"
+                        f"实测 {axis} {angle:+.2f}°"
+                    )
+                    return
+                speed_factor, source = self._gyro_jog_speed_factor(
+                    axis, target_rate, state.tool
+                )
+                self._gyro_x_phase = "lead_in"
+                self._gyro_x_phase_started_ns = now
                 self._auto_action_stable_since_ns = 0
                 self._append_log(
-                    f"G01 开始 Rx+ 点动：速度比例 {speed_factor}%（{source}），"
-                    "等待经过 -75°并达到 +15±3°/s",
+                    f"{step_id} 开始 {axis}{'+' if target_rate > 0 else '-'} 点动："
+                    f"速度比例 {speed_factor}%（{source}），等待经过 "
+                    f"{capture_start:+.1f}°并达到 {target_rate:+.1f}±"
+                    f"{rate_tolerance:.1f}°/s",
                     "info",
                 )
                 if not self.robot.start_tool_jog(
-                    "Rx", True, speed_factor, user=state.user, tool=state.tool
+                    axis,
+                    target_rate > 0,
+                    speed_factor,
+                    user=state.user,
+                    tool=state.tool,
                 ):
-                    self._fail_g01_auto_action("G01 连续点动命令发送失败")
+                    self._fail_gyro_x_auto_action(f"{step_id} 连续点动命令发送失败")
                     return
-                self._g01_jog_active = True
+                self._gyro_x_jog_speed_factor = speed_factor
+                self._gyro_x_decel_level = -1
+                self._gyro_x_jog_active = True
                 return
-            if abs(angle) > 2.0:
-                self._fail_g01_auto_action(
-                    f"G01 回 X 中位后仍偏差 {angle:+.2f}°"
+            if phase == "postposition":
+                decel_end = self._gyro_decel_endpoint(step_id)
+                if abs(angle - decel_end) > GYRO_ENDPOINT_TOLERANCE_DEG:
+                    self._fail_gyro_x_auto_action(
+                        f"{step_id} 减速端点到位异常：目标 {axis} "
+                        f"{decel_end:+.1f}°，实测 {angle:+.2f}°"
+                    )
+                    return
+                self._begin_gyro_x_return(step_id, axis, angle, now)
+                return
+            orientation_error = self._orientation_error_deg(
+                self._gyro_x_reference_pose, state.pose
+            )
+            if orientation_error > 2.0:
+                self._fail_gyro_x_auto_action(
+                    f"{step_id} 回标定中位后仍有三维姿态偏差 "
+                    f"{orientation_error:.2f}°（{axis}={angle:+.2f}°）"
                 )
                 return
-            self._g01_phase = ""
-            self._g01_reference_pose = None
-            self._finish_auto_action("G01 已完成采集并回到 X 中位", "good")
+            if step_id == "G02":
+                self._gyro_x_phase = "restore_neutral_rz"
+                self._gyro_x_phase_started_ns = now
+                self._auto_action_seen_motion = False
+                self._append_log(
+                    f"G02 已回到 -Y 基准，开始 Tool Rz "
+                    f"+{G02_RESTORE_NEUTRAL_RZ_DEG:.1f}°回全局 -X 标定中位",
+                    "good",
+                )
+                if not self.robot.relative_tool_rotation(
+                    "Rz",
+                    G02_RESTORE_NEUTRAL_RZ_DEG,
+                    GYRO_RETURN_SPEED_PERCENT,
+                ):
+                    self._fail_gyro_x_auto_action(
+                        "G02 Rz 回全局标定中位命令发送失败"
+                    )
+                return
+            self._gyro_x_phase = ""
+            self._gyro_x_reference_pose = None
+            detail = (
+                "G01 已完成采集并回到 G01/G02 共用 -Y 基准"
+                if step_id == "G01"
+                else f"{step_id} 已完成采集并回到标定中位"
+            )
+            self._finish_auto_action(detail, "good")
             return
 
-        if self._g01_reference_pose is None:
-            self._fail_g01_auto_action("G01 缺少 X 中位参考姿态")
+        if self._gyro_x_reference_pose is None:
+            self._fail_gyro_x_auto_action(f"{step_id} 缺少标定中位参考姿态")
             return
-        angle = self._relative_tool_rx_deg(self._g01_reference_pose, state.pose)
+        angle = self._relative_tool_axis_deg(
+            self._gyro_x_reference_pose, state.pose, axis
+        )
         tool_rate = self.coordinator._tool_angular_speed(
             state.pose, state.angular_speed
-        )[0]
+        )[axis_index]
         if phase == "lead_in":
             rate_ok = (
-                G01_TARGET_RATE_DEG_S - G01_RATE_TOLERANCE_DEG_S
+                target_rate - rate_tolerance
                 <= tool_rate
-                <= G01_TARGET_RATE_DEG_S + G01_RATE_TOLERANCE_DEG_S
+                <= target_rate + rate_tolerance
             )
             if rate_ok:
                 if self._auto_action_stable_since_ns == 0:
@@ -1466,57 +2225,560 @@ class QuickCalWindow(QMainWindow):
                 self._auto_action_stable_since_ns = 0
             stable = (
                 self._auto_action_stable_since_ns
-                and now - self._auto_action_stable_since_ns >= G01_SPEED_STABLE_NS
+                and now - self._auto_action_stable_since_ns >= GYRO_SPEED_STABLE_NS
             )
-            if angle >= G01_CAPTURE_START_DEG and stable:
+            reached_start = (
+                angle >= capture_start if target_rate > 0 else angle <= capture_start
+            )
+            if reached_start and stable:
                 self.coordinator.condition_stable_since_ns = now - 1_100_000_000
                 if not self.coordinator.confirm_current_action():
-                    self._fail_g01_auto_action("G01 匀速到位后的阶段开启复检未通过")
+                    self._fail_gyro_x_auto_action(
+                        f"{step_id} 匀速到位后的阶段开启复检未通过"
+                    )
                     return
-                self._g01_phase = "wait_stage_open"
+                self._gyro_x_phase = "wait_stage_open"
                 self._append_log(
-                    f"G01 经过 Rx {angle:+.2f}°，实测 {tool_rate:+.2f}°/s，正在开启采集",
+                    f"{step_id} 经过 {axis} {angle:+.2f}°，实测 {tool_rate:+.2f}°/s，"
+                    "正在开启采集",
                     "good",
                 )
                 return
-            if angle > -65.0:
-                self._fail_g01_auto_action(
-                    f"G01 已越过 -65°仍未达到稳定速度：实测 {tool_rate:+.2f}°/s"
+            missed_threshold = (
+                capture_start + GYRO_MISSED_START_MARGIN_DEG
+                if target_rate > 0
+                else capture_start - GYRO_MISSED_START_MARGIN_DEG
+            )
+            missed_start = (
+                angle > missed_threshold
+                if target_rate > 0
+                else angle < missed_threshold
+            )
+            if missed_start:
+                self._fail_gyro_x_auto_action(
+                    f"{step_id} 已越过 {missed_threshold:+.1f}°"
+                    f"仍未达到稳定速度：实测 {tool_rate:+.2f}°/s"
                 )
             return
         if phase == "wait_stage_open" and self.coordinator.state == RunState.CAPTURING:
-            self._g01_phase = "capturing"
+            self._gyro_x_phase = "capturing"
+            return
+        if phase == "capturing":
+            if step_id in GYRO_LIMITED_STEPS:
+                end_angle = (
+                    self.coordinator.limits.positive_safe_deg
+                    if target_rate > 0
+                    else self.coordinator.limits.negative_safe_deg
+                )
+                overshoot = 2.0
+            else:
+                end_angle = -capture_start
+                overshoot = 5.0
+            beyond_end = (
+                angle > end_angle + overshoot
+                if target_rate > 0
+                else angle < end_angle - overshoot
+            )
+            if beyond_end:
+                self._fail_gyro_x_auto_action(
+                    f"{step_id} 扫转已越过预计终点：{axis}={angle:+.2f}°，"
+                    f"终点={end_angle:+.2f}°，已紧急停止"
+                )
+            return
+        if phase == "smooth_decel":
+            capture_end = (
+                self.coordinator.limits.positive_safe_deg
+                if step_id in GYRO_LIMITED_STEPS and target_rate > 0
+                else self.coordinator.limits.negative_safe_deg
+                if step_id in GYRO_LIMITED_STEPS
+                else -capture_start
+            )
+            decel_end = self._gyro_decel_endpoint(step_id)
+            direction = 1.0 if target_rate > 0 else -1.0
+            region_deg = direction * (decel_end - capture_end)
+            progress_deg = direction * (angle - capture_end)
+            if region_deg <= 0.0:
+                self._fail_gyro_x_auto_action(
+                    f"{step_id} 减速区配置无效：{capture_end:+.1f}°→{decel_end:+.1f}°"
+                )
+                return
+            if progress_deg > region_deg + 1.0:
+                self._fail_gyro_x_auto_action(
+                    f"{step_id} 丝滑减速时越过外端点：{axis}={angle:+.2f}°"
+                )
+                return
+            progress_ratio = max(0.0, progress_deg / region_deg)
+            desired_level = max(
+                index
+                for index, (threshold, _multiplier) in enumerate(
+                    GYRO_SMOOTH_DECEL_PROFILE
+                )
+                if progress_ratio >= threshold
+            )
+            if desired_level > self._gyro_x_decel_level:
+                if not self._set_gyro_x_decel_level(desired_level):
+                    self._fail_gyro_x_auto_action(
+                        f"{step_id} 动态降低点动速度失败，已停止机械臂"
+                    )
+                    return
+            remaining_deg = direction * (decel_end - angle)
+            if remaining_deg <= GYRO_SMOOTH_STOP_MARGIN_DEG:
+                self._stop_gyro_x_jog(restore_speed=False)
+                self._gyro_x_phase = "wait_jog_stop"
+                self._gyro_x_phase_started_ns = now
             return
         if phase == "wait_jog_stop":
             if state.mode != 5 or state.angular_speed_norm > 0.8:
                 return
+            # Some controller versions reject SpeedFactor while a jog is still
+            # decelerating, so restore it only after the robot is truly idle.
+            self._restore_gyro_x_speed_factor()
+            step_index = GYRO_AUTO_STEPS.index(step_id)
+            expected_next = (
+                GYRO_AUTO_STEPS[step_index + 1]
+                if step_index + 1 < len(GYRO_AUTO_STEPS)
+                else (
+                    "S01"
+                    if self.coordinator.SKIP_MAGNETIC_STAGES
+                    else "M01"
+                )
+            )
             if (
                 self.coordinator.state != RunState.READY
-                or self.coordinator.current_step.step_id != "G02"
+                or self.coordinator.current_step.step_id != expected_next
             ):
                 return
-            return_angle = self._relative_tool_rx_deg(
-                self._g01_reference_pose, state.pose
+            stop_angle = self._relative_tool_axis_deg(
+                self._gyro_x_reference_pose, state.pose, axis
             )
-            if abs(return_angle) < 0.5:
-                self._g01_phase = "return"
-                self._g01_phase_started_ns = now - 800_000_000
-                self._auto_action_seen_motion = True
+            decel_end = self._gyro_decel_endpoint(step_id)
+            if step_id in GYRO_LIMITED_STEPS:
+                limits = self.coordinator.limits
+                if not (
+                    limits.negative_soft_limit_deg - 1.0
+                    <= stop_angle
+                    <= limits.positive_soft_limit_deg + 1.0
+                ):
+                    self._fail_gyro_x_auto_action(
+                        f"{step_id} 减速时越过 Tool {axis} 软限位："
+                        f"当前 {stop_angle:+.2f}°"
+                    )
+                    return
+            if abs(stop_angle - decel_end) <= GYRO_ENDPOINT_TOLERANCE_DEG:
+                self._begin_gyro_x_return(step_id, axis, stop_angle, now)
                 return
-            if abs(return_angle) > 180.0:
-                self._fail_g01_auto_action(
-                    f"G01 停止位置无法安全回中：Rx {return_angle:+.2f}°"
+            endpoint_move = decel_end - stop_angle
+            if abs(endpoint_move) > 30.0:
+                self._fail_gyro_x_auto_action(
+                    f"{step_id} 减速停止位置异常：{axis} {stop_angle:+.2f}°，"
+                    f"距离端点 {decel_end:+.1f}° 仍有 {endpoint_move:+.2f}°"
                 )
                 return
-            self._g01_phase = "return"
-            self._g01_phase_started_ns = now
+            self._gyro_x_phase = "postposition"
+            self._gyro_x_phase_started_ns = now
             self._auto_action_seen_motion = False
             self._append_log(
-                f"G01 采集扫转停止于 Rx {return_angle:+.2f}°，开始回 X 中位",
+                f"{step_id} 已在采集窗外停止于 {axis} {stop_angle:+.2f}°，"
+                f"以 {GYRO_POSTPOSITION_SPEED_PERCENT}% 补偿到减速端点 "
+                f"{decel_end:+.1f}°",
                 "info",
             )
-            if not self.robot.relative_tool_rotation("Rx", -return_angle, 80):
-                self._fail_g01_auto_action("G01 回 X 中位命令发送失败")
+            if not self.robot.relative_tool_rotation(
+                axis,
+                endpoint_move,
+                GYRO_POSTPOSITION_SPEED_PERCENT,
+                GYRO_POSTPOSITION_ACCEL_PERCENT,
+            ):
+                self._fail_gyro_x_auto_action(
+                    f"{step_id} 减速端点补偿命令发送失败"
+                )
+
+    def _start_mag_auto_action(self, step_id: str) -> None:
+        if step_id not in MAG_AUTO_STEPS:
+            self._show_error(f"不支持的自动磁翻转步骤：{step_id}", True)
+            return
+        if self._auto_action_step is not None:
+            self._show_error("机械臂自动动作已经在执行", False)
+            return
+        if (
+            self.coordinator.state != RunState.READY
+            or self.coordinator.current_step.step_id != step_id
+        ):
+            self._show_error(f"只有在 {step_id} 等待动作条件时才能执行自动磁翻转", False)
+            return
+        if not self.coordinator.environment_confirmed:
+            self._show_error("磁翻转前必须确认磁环境、夹具和线束状态", True)
+            return
+        if step_id == "M01" and not self.coordinator.limits.valid:
+            self._show_error("Tool Rx 实测限位未通过，禁止执行 M01 Roll/Pitch 翻转", True)
+            return
+        state = self.robot.latest_state
+        if (
+            not self.robot.connected
+            or state is None
+            or time.monotonic_ns() - state.received_monotonic_ns >= 1_000_000_000
+            or state.mode != 5
+            or state.linear_speed_norm > 1.0
+            or state.angular_speed_norm > 0.8
+        ):
+            self._show_error("机械臂未连接、反馈超时或未在已使能静止状态", True)
+            return
+        neutral = self.taught_poses.get("neutral")
+        if neutral is None or state.user != neutral.user or state.tool != neutral.tool:
+            self._show_error(
+                f"当前 User/Tool 与示教标定中位不一致，禁止执行 {step_id}", True
+            )
+            return
+        neutral_error = self._orientation_error_deg(neutral.pose, state.pose)
+        if neutral_error > MAG_NEUTRAL_TOLERANCE_DEG:
+            self._show_error(
+                f"{step_id} 必须从标定中位开始；当前三维姿态偏差 "
+                f"{neutral_error:.2f}°，允许 {MAG_NEUTRAL_TOLERANCE_DEG:.1f}°",
+                True,
+            )
+            return
+        trajectory = MAG_TRAJECTORIES[step_id]
+        planned_s = sum(duration_s for _axis, _positive, duration_s in trajectory)
+        if step_id == "M04":
+            planned_s = self.coordinator.current_step.capture_s
+        if abs(planned_s - self.coordinator.current_step.capture_s) > 0.01:
+            self._show_error(
+                f"{step_id} 自动轨迹 {planned_s:.1f} s 与阶段采集时间 "
+                f"{self.coordinator.current_step.capture_s:.1f} s 不一致",
+                True,
+            )
+            return
+        path_text = (
+            " → ".join(
+                f"{axis}{'+' if positive else '-'}({duration_s:.1f}s)"
+                for axis, positive, duration_s in trajectory
+            )
+            if trajectory
+            else "Tool Rz=0°，标定中位静止保持"
+        )
+        limits = self.coordinator.limits
+        if step_id == "M01":
+            action_detail = (
+                f"Yaw 保持中位，仅执行 Roll/Pitch：{path_text}\n"
+                f"目标速度 {MAG_TARGET_RATE_DEG_S[step_id]:.1f}°/s；"
+                f"受限 Tool Rx 强制保持在安全位 "
+                f"{limits.negative_safe_deg:+.1f}°～{limits.positive_safe_deg:+.1f}°。"
+            )
+        elif step_id == "M02":
+            action_detail = (
+                f"Yaw 正向单侧往返：{path_text}\n"
+                f"目标速度 {MAG_TARGET_RATE_DEG_S[step_id]:.1f}°/s，"
+                f"路径约 0° → +{MAG_YAW_SAFE_DEG:.0f}° → 0°。"
+            )
+        elif step_id == "M03":
+            action_detail = (
+                f"Yaw 负向单侧往返：{path_text}\n"
+                f"目标速度 {MAG_TARGET_RATE_DEG_S[step_id]:.1f}°/s，"
+                f"路径约 0° → -{MAG_YAW_SAFE_DEG:.0f}° → 0°。"
+            )
+        else:
+            action_detail = "确认 Tool Rz=0° 中位，机械臂静止保持 15 秒，线束无受力。"
+        message = (
+            f"{step_id} 将按工单执行 15 秒磁阶段：\n{action_detail}\n"
+            "阶段完成后机械臂保持或回到示教标定中位。\n\n"
+            "请确认完整路径无碰撞、线束无拉扯，人员已离开运动区域。"
+        )
+        if (
+            not self._full_auto_enabled
+            and QMessageBox.question(
+                self, f"确认执行 {step_id} 自动磁工单动作", message
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+
+        now = time.monotonic_ns()
+        self._auto_action_step = step_id
+        self._auto_action_started_ns = now
+        self._auto_action_deadline_ns = now + int(MAG_TIMEOUT_S * 1_000_000_000)
+        self._auto_action_stable_since_ns = 0
+        self._auto_action_seen_motion = False
+        self._mag_phase = "lead_in"
+        self._mag_phase_started_ns = now
+        self._mag_segment_index = -1
+        self._mag_reference_pose = tuple(neutral.pose)
+        self._mag_original_speed_factor = self._speed_factor_percent(
+            state.speed_scaling
+        )
+        self._mag_speed_factor = 0
+        self._mag_speed_source = ""
+        self._mag_jog_active = False
+        self.coordinator.condition_stable_since_ns = 0
+        self.coordinator.recorder.marker(
+            "robot_auto_move_request",
+            step_id,
+            f"trajectory={path_text}; duration={planned_s:.1f}s; "
+            f"rate={MAG_TARGET_RATE_DEG_S.get(step_id, 0.0):.1f}deg/s; "
+            f"Rx_safe={limits.negative_safe_deg:+.1f}..{limits.positive_safe_deg:+.1f}",
+        )
+        self._append_log(
+            f"{step_id} 开始磁工单动作，原全局速度比例 "
+            f"{self._mag_original_speed_factor}%：{path_text}",
+            "info",
+        )
+        self._update_action_controls()
+        if step_id == "M04":
+            self._mag_phase = "wait_stage_open"
+            self.coordinator.condition_stable_since_ns = now - 600_000_000
+            if not self.coordinator.confirm_current_action():
+                self._fail_mag_auto_action("M04 中位静止后的阶段开启复检未通过")
+            else:
+                self._append_log("M04 正在开启中位静止磁阶段", "good")
+            return
+        self._start_mag_segment(step_id, 0, state)
+
+    def _start_mag_segment(self, step_id: str, index: int, state) -> bool:
+        trajectory = MAG_TRAJECTORIES[step_id]
+        if not 0 <= index < len(trajectory):
+            self._fail_mag_auto_action(f"{step_id} 磁动作段号越界：{index}")
+            return False
+        axis, positive, _duration_s = trajectory[index]
+        if self._mag_jog_active:
+            if not self.robot.stop_tool_jog():
+                self._fail_mag_auto_action(f"{step_id} 切换磁动作轴时停止失败")
+                return False
+            self._mag_jog_active = False
+        rate = MAG_TARGET_RATE_DEG_S[step_id]
+        target_rate = rate if positive else -rate
+        if self._mag_speed_factor == 0:
+            self._mag_speed_factor, self._mag_speed_source = (
+                self._gyro_jog_speed_factor(axis, target_rate, state.tool)
+            )
+            command_ok = self.robot.start_tool_jog(
+                axis,
+                positive,
+                self._mag_speed_factor,
+                user=state.user,
+                tool=state.tool,
+            )
+        else:
+            command_ok = self.robot.switch_tool_jog(
+                axis,
+                positive,
+                user=state.user,
+                tool=state.tool,
+            )
+        if not command_ok:
+            self._fail_mag_auto_action(
+                f"{step_id} Tool {axis}{'+' if positive else '-'} 点动发送失败"
+            )
+            return False
+        self._mag_jog_active = True
+        self._mag_segment_index = index
+        self._auto_action_stable_since_ns = 0
+        detail = (
+            f"segment={index + 1}/{len(trajectory)}; axis={axis}; "
+            f"direction={'+' if positive else '-'}; target={target_rate:+.1f}deg/s; "
+            f"speed_factor={self._mag_speed_factor}%; "
+            f"source={self._mag_speed_source}"
+        )
+        self.coordinator.recorder.marker("robot_auto_move_phase", step_id, detail)
+        self._append_log(f"{step_id} 磁工单动作：{detail}", "info")
+        return True
+
+    def _restore_mag_speed_factor(self) -> None:
+        if self._mag_original_speed_factor:
+            self.robot.set_speed_factor(self._mag_original_speed_factor)
+            self._mag_original_speed_factor = 0
+        self._mag_speed_factor = 0
+        self._mag_speed_source = ""
+
+    def _stop_mag_jog(self, restore_speed: bool = True) -> None:
+        if self._mag_jog_active:
+            self.robot.stop_tool_jog()
+            self._mag_jog_active = False
+        if restore_speed:
+            self._restore_mag_speed_factor()
+
+    def _fail_mag_auto_action(self, message: str) -> None:
+        self._stop_mag_jog(restore_speed=False)
+        self.robot.stop()
+        self._mag_original_speed_factor = 0
+        self._mag_speed_factor = 0
+        self._mag_speed_source = ""
+        self._mag_phase = ""
+        self._mag_phase_started_ns = 0
+        self._mag_segment_index = -1
+        self._mag_reference_pose = None
+        self._finish_auto_action(message, "error")
+        if self.coordinator.running:
+            self.coordinator.abort(message)
+
+    def _mag_limit_error(self, step_id: str, state) -> str:
+        if self._mag_reference_pose is None:
+            return "磁翻转缺少标定中位参考姿态"
+        if step_id == "M01":
+            rx_deg = self._relative_tool_axis_deg(
+                self._mag_reference_pose, state.pose, "Rx"
+            )
+            limits = self.coordinator.limits
+            if not (
+                limits.negative_safe_deg - 1.0
+                <= rx_deg
+                <= limits.positive_safe_deg + 1.0
+            ):
+                return (
+                    f"Roll/Pitch 翻转越过受限 Tool Rx 安全位：当前 {rx_deg:+.2f}°，"
+                    f"允许 {limits.negative_safe_deg:+.1f}°～"
+                    f"{limits.positive_safe_deg:+.1f}°"
+                )
+        elif step_id in ("M02", "M03"):
+            yaw_deg = self._relative_tool_axis_deg(
+                self._mag_reference_pose, state.pose, "Rz"
+            )
+            margin_deg = 5.0
+            lower_deg, upper_deg = (
+                (-margin_deg, MAG_YAW_SAFE_DEG + margin_deg)
+                if step_id == "M02"
+                else (-MAG_YAW_SAFE_DEG - margin_deg, margin_deg)
+            )
+            if not lower_deg <= yaw_deg <= upper_deg:
+                return (
+                    f"Yaw 单侧往返越过 {step_id} 安全范围：当前 Tool Rz "
+                    f"{yaw_deg:+.2f}°，允许 {lower_deg:+.1f}°～{upper_deg:+.1f}°"
+                )
+        return ""
+
+    def _update_mag_auto_action(self, state) -> None:
+        step_id = self._auto_action_step
+        if step_id not in MAG_AUTO_STEPS:
+            return
+        now = time.monotonic_ns()
+        self._check_auto_action_timeout(now)
+        if self._auto_action_step != step_id:
+            return
+        limit_error = self._mag_limit_error(step_id, state)
+        if limit_error and self._mag_phase not in ("wait_jog_stop", "return"):
+            self._fail_mag_auto_action(f"{step_id} {limit_error}")
+            return
+        phase = self._mag_phase
+        if phase == "lead_in":
+            axis, positive, _duration_s = MAG_TRAJECTORIES[step_id][
+                self._mag_segment_index
+            ]
+            axis_index = {"Rx": 0, "Ry": 1, "Rz": 2}[axis]
+            rate = MAG_TARGET_RATE_DEG_S[step_id]
+            target_rate = rate if positive else -rate
+            tool_rate = self.coordinator._tool_angular_speed(
+                state.pose, state.angular_speed
+            )[axis_index]
+            rate_ok = abs(tool_rate - target_rate) <= MAG_RATE_TOLERANCE_DEG_S
+            if rate_ok:
+                if self._auto_action_stable_since_ns == 0:
+                    self._auto_action_stable_since_ns = now
+            else:
+                self._auto_action_stable_since_ns = 0
+            if (
+                self._auto_action_stable_since_ns
+                and now - self._auto_action_stable_since_ns >= GYRO_SPEED_STABLE_NS
+            ):
+                self.coordinator.condition_stable_since_ns = now - 400_000_000
+                if not self.coordinator.confirm_current_action():
+                    self._fail_mag_auto_action(
+                        f"{step_id} 磁动作稳定后的阶段开启复检未通过"
+                    )
+                    return
+                self._mag_phase = "wait_stage_open"
+                self._append_log(
+                    f"{step_id} Tool {axis} 实测 {tool_rate:+.2f}°/s，正在开启磁采集",
+                    "good",
+                )
+            return
+        if phase == "wait_stage_open":
+            return
+        if phase == "capturing":
+            if self.coordinator.state != RunState.CAPTURING:
+                return
+            elapsed_s = max(
+                0.0,
+                (now - self.coordinator.capture_started_ns) / 1_000_000_000.0,
+            )
+            desired_index = len(MAG_TRAJECTORIES[step_id]) - 1
+            cumulative_s = 0.0
+            for index, (_axis, _positive, duration_s) in enumerate(
+                MAG_TRAJECTORIES[step_id]
+            ):
+                cumulative_s += duration_s
+                if elapsed_s < cumulative_s:
+                    desired_index = index
+                    break
+            if desired_index != self._mag_segment_index:
+                self._start_mag_segment(step_id, desired_index, state)
+            return
+        if phase == "static_capturing":
+            return
+        if phase == "wait_jog_stop":
+            if state.mode != 5 or state.angular_speed_norm > 0.8:
+                return
+            self._restore_mag_speed_factor()
+            if (
+                self.coordinator.state != RunState.READY
+                or self.coordinator.current_step.step_id == step_id
+            ):
+                return
+            neutral = self.taught_poses.get("neutral")
+            if neutral is None:
+                self._fail_mag_auto_action(f"{step_id} 缺少示教标定中位")
+                return
+            orientation_error = self._orientation_error_deg(neutral.pose, state.pose)
+            self._mag_phase = "return"
+            self._mag_phase_started_ns = now
+            self._auto_action_seen_motion = False
+            if orientation_error <= MAG_NEUTRAL_TOLERANCE_DEG:
+                self._finish_mag_return(step_id, orientation_error)
+                return
+            self._append_log(
+                f"{step_id} 采集完成，当前与中位偏差 {orientation_error:.2f}°，"
+                "开始回示教标定中位",
+                "info",
+            )
+            if not self.robot.move_pose_j(
+                neutral.pose,
+                NEUTRAL_RETURN_SPEED_PERCENT,
+                user=neutral.user,
+                tool=neutral.tool,
+            ):
+                self._fail_mag_auto_action(f"{step_id} 回标定中位命令发送失败")
+            return
+        if phase == "return":
+            if state.mode in (7, 8) or state.angular_speed_norm > 0.8:
+                self._auto_action_seen_motion = True
+                return
+            if state.mode != 5 or state.linear_speed_norm > 1.0:
+                return
+            if (
+                not self._auto_action_seen_motion
+                and now - self._mag_phase_started_ns < 800_000_000
+            ):
+                return
+            neutral = self.taught_poses.get("neutral")
+            if neutral is None:
+                self._fail_mag_auto_action(f"{step_id} 缺少示教标定中位")
+                return
+            orientation_error = self._orientation_error_deg(neutral.pose, state.pose)
+            if orientation_error > MAG_NEUTRAL_TOLERANCE_DEG:
+                self._fail_mag_auto_action(
+                    f"{step_id} 回标定中位后姿态偏差 {orientation_error:.2f}°，"
+                    f"允许 {MAG_NEUTRAL_TOLERANCE_DEG:.1f}°"
+                )
+                return
+            self._finish_mag_return(step_id, orientation_error)
+
+    def _finish_mag_return(self, step_id: str, orientation_error: float) -> None:
+        self._mag_phase = ""
+        self._mag_phase_started_ns = 0
+        self._mag_segment_index = -1
+        self._mag_reference_pose = None
+        self._finish_auto_action(
+            f"{step_id} 已完成 15 秒工单动作并回到标定中位，"
+            f"姿态偏差 {orientation_error:.2f}°",
+            "good",
+        )
 
     def _update_accel_auto_action(self, state) -> None:
         step_id = self._auto_action_step
@@ -1576,18 +2838,18 @@ class QuickCalWindow(QMainWindow):
         )
 
     def _refresh_taught_pose_label(self) -> None:
-        labels = []
-        tooltips = []
+        pose_buttons = {
+            "safe": (self.robot_teach_safe, self.robot_safe),
+            "neutral": (self.robot_teach_neutral, self.robot_neutral),
+        }
         for name, title in (("safe", "安全位"), ("neutral", "标定中位")):
             taught = self.taught_poses.get(name)
             if taught is None:
-                labels.append(f"{title}：未示教")
-                continue
-            source = "历史位姿" if not taught.joints else taught.recorded_at.replace("T", " ")
-            labels.append(f"{title}：已记录 {source}｜U{taught.user}/T{taught.tool}")
-            tooltips.append(f"{title}\n{self._pose_text(taught)}")
-        self.robot_pose_label.setText("\n".join(labels))
-        self.robot_pose_label.setToolTip("\n\n".join(tooltips))
+                tooltip = f"{title}尚未示教"
+            else:
+                tooltip = f"{title}\n{self._pose_text(taught)}"
+            for button in pose_buttons[name]:
+                button.setToolTip(tooltip)
 
     def _teach_pose(self, name: str) -> None:
         if self.coordinator.running:
@@ -1611,7 +2873,7 @@ class QuickCalWindow(QMainWindow):
         warning = (
             "请确认当前位置远离碰撞、线束无拉扯，且已经低速验证运动余量。"
             if name == "safe"
-            else "请确认从这里绕夹具 Tool X/Y 可达 ±75°、Yaw 可达设定安全限位，且线束无拉扯。"
+            else "请确认从这里绕夹具 Tool X 可达设定安全限位、Tool Y/Z 可达 ±75°，且线束无拉扯。"
         )
         message = f"将当前位置记录为{title}。\n\n{self._pose_text(taught)}\n\n{warning}{overwrite}\n\n确认记录？"
         if QMessageBox.question(self, f"示教{title}", message) != QMessageBox.StandardButton.Yes:
@@ -1641,7 +2903,7 @@ class QuickCalWindow(QMainWindow):
         if not self.robot.connected or state is None or state.mode != 5:
             self._show_error(f"移动到{title}要求机械臂已连接、已使能且处于空闲状态", True)
             return
-        velocity_percent = 30 if name == "neutral" else 15
+        velocity_percent = NEUTRAL_RETURN_SPEED_PERCENT if name == "neutral" else 15
         message = (
             f"机械臂将先启用 User {taught.user} / Tool {taught.tool}，"
             f"再以 {velocity_percent}% 速度移动到{title}。\n\n"
@@ -1697,7 +2959,7 @@ class QuickCalWindow(QMainWindow):
             )
         except (ValueError, AttributeError):
             if not silent:
-                self._show_error("Yaw 限位参数必须是有效数字", True)
+                self._show_error("G01/G02 配置轴限位参数必须是有效数字", True)
             return None
 
     @Slot()
@@ -1711,23 +2973,63 @@ class QuickCalWindow(QMainWindow):
             return
         result = "通过" if limits.valid else "不通过"
         self.limits_result.setText(
-            f"负向安全位：{limits.negative_safe_deg:+.1f}°\n"
-            f"正向安全位：{limits.positive_safe_deg:+.1f}°\n"
-            f"有效扫描角度：{limits.scan_angle_deg:.1f}°\n"
-            f"G05/G06 单方向有效采集：{limits.capture_s:.3f} s\n"
+            f"完整运动：{limits.negative_soft_limit_deg:+.1f}°～"
+            f"{limits.positive_soft_limit_deg:+.1f}°\n"
+            f"加速区：-55.0°→-45.0°｜减速区：+45.0°→+55.0°\n"
+            f"反向动作与上述区间对称\n"
+            f"匀速采集：{limits.negative_safe_deg:+.1f}°～"
+            f"{limits.positive_safe_deg:+.1f}°，固定 {LIMITED_GYRO_CAPTURE_S:.1f} s\n"
             f"路径判定：{result}"
         )
         self.limits_result.setStyleSheet("color:#087f5b;" if limits.valid else "color:#b42318;")
+        configured_steps = steps_for_limits(limits)
+        if self.coordinator.SKIP_MAGNETIC_STAGES:
+            displayed_total_s = sum(
+                step.total_s
+                for step in configured_steps
+                if not step.step_id.startswith("M")
+            )
+            displayed_capture_s = sum(
+                step.capture_s
+                for step in configured_steps
+                if not step.step_id.startswith("M")
+            )
+        else:
+            displayed_total_s = expected_total_seconds(limits)
+            displayed_capture_s = expected_capture_seconds(limits)
         self.timeline_summary.setText(
-            f"预计工单总时长：{expected_total_seconds(limits):.1f} s\n"
-            f"预计有效采集时间：{expected_capture_seconds(limits):.1f} s\n"
-            "时间来自 QuickCal_V1_Robot_Control_Steps_15dps.xlsx。"
+            f"预计工单总时长：{displayed_total_s:.1f} s\n"
+            f"预计有效采集时间：{displayed_capture_s:.1f} s\n"
+            "阶段与采集时间来自 V1.3 r024 无磁 QuickCal 协议。\n"
+            + (
+                "r024 无磁 QuickCal：正式阶段仅 P1/A01-A06/G01-G06，G06 后回中静止并自动提交。"
+                if self.coordinator.SKIP_MAGNETIC_STAGES
+                else "磁标定流程已启用：G06 后继续执行 M01-M04。"
+            )
         )
         self._populate_workflow()
 
     def _start_session(self) -> None:
         limits = self._limits_from_ui()
         if limits is None:
+            return
+        unavailable_actions = [
+            step_id
+            for step_id in (
+                "A01", "A02", "A03", "A04", "A05", "A06",
+                "G01", "G02", "G03", "G04", "G05", "G06",
+            )
+            if (
+                (config := self._config_for_step(step_id)) is None
+                or not config.enabled
+            )
+        ]
+        if unavailable_actions:
+            self._show_error(
+                "开始全自动校准前必须启用 A01-A06 和 G01-G06 机械臂动作："
+                + "、".join(unavailable_actions),
+                True,
+            )
             return
         if "safe" not in self.taught_poses or "neutral" not in self.taught_poses:
             self._show_error("开始标定前必须先示教安全位和标定中位", True)
@@ -1740,6 +3042,12 @@ class QuickCalWindow(QMainWindow):
             )
             return
         try:
+            gyro_motion_map = {}
+            for step_id in GYRO_AUTO_STEPS:
+                axis, _lead_in, _capture_start, target_rate = (
+                    self._gyro_motion_parameters(step_id)
+                )
+                gyro_motion_map[step_id] = (axis, target_rate)
             self.coordinator.configure(
                 self.sn_edit.text(),
                 self.station_edit.text(),
@@ -1748,17 +3056,30 @@ class QuickCalWindow(QMainWindow):
                 limits,
                 self.environment_check.isChecked(),
                 neutral_pose=neutral.pose,
+                gyro_motion_map=gyro_motion_map,
             )
         except Exception as exc:
             self._show_error(str(exc), True)
             return
         self._populate_workflow()
-        self.coordinator.start_session()
+        self._full_auto_enabled = True
+        if not self.coordinator.start_session():
+            self._stop_full_auto()
+            return
+        self._full_auto_timer.start()
+        self._append_log(
+            "全自动流程已启动：后续步骤将按顺序自动执行；任一步门控或 ACK 失败都会立即停止",
+            "good",
+        )
 
     @Slot(bool, str)
     def _robot_connection_changed(self, connected: bool, detail: str) -> None:
         self.robot_connect.setText("断开" if connected else "连接")
         if not connected:
+            if self._manual_motion_target is not None:
+                self._finish_manual_motion(
+                    "手动运动失败：机械臂连接中断", "error"
+                )
             self._robot_enable_pending = None
             self._robot_enable_timeout.stop()
             self._manual_absolute_pose_initialized = False
@@ -1777,6 +3098,7 @@ class QuickCalWindow(QMainWindow):
         self._set_badge(self.glove_badge, "手套已连接" if connected else "手套未连接", "ok" if connected else "bad")
         self._ui_raw_imu_frame = None
         self._ui_raw_imu_ns = 0
+        self._ui_register_imu_frame = None
         self._ui_register_imu_ns = 0
         for row in range(len(IMU_NAMES)):
             for column in range(2, 6):
@@ -1816,9 +3138,12 @@ class QuickCalWindow(QMainWindow):
             self.robot_state_label.setToolTip("")
         self.robot_state_label.setText(state_text)
         if hasattr(self, "tool_motion_feedback"):
+            motion_state = "静止" if state.angular_speed_norm <= 0.8 else "运动中"
             self.tool_motion_feedback.setText(
-                f"当前反馈：User {state.user} / Tool {state.tool}｜"
-                f"TCP=({pose})｜|ω|={state.angular_speed_norm:.2f}°/s"
+                f"U{state.user} / T{state.tool}｜{motion_state}"
+            )
+            self.tool_motion_feedback.setToolTip(
+                f"TCP=({pose})｜实时角速度 |ω|={state.angular_speed_norm:.2f}°/s"
             )
             configured_tool = int(self.tool_offset_config["tool"])
             configured_offset = ", ".join(
@@ -1828,6 +3153,7 @@ class QuickCalWindow(QMainWindow):
                 f"本地 Tool {configured_tool}=({configured_offset})｜"
                 f"控制器当前反馈 Tool {state.tool}"
             )
+            self._update_manual_motion_result(state)
         enabled = self._robot_mode_is_enabled(state.mode)
         if self._robot_enable_pending is not None and enabled == self._robot_enable_pending:
             self._robot_enable_pending = None
@@ -1841,8 +3167,10 @@ class QuickCalWindow(QMainWindow):
             self._set_badge(self.robot_badge, "机械臂已使能", "ok")
         else:
             self._set_badge(self.robot_badge, "机械臂未使能", "warn")
-        if self._auto_action_step == "G01":
-            self._update_g01_auto_action(state)
+        if self._auto_action_step in GYRO_AUTO_STEPS:
+            self._update_gyro_x_auto_action(state)
+        elif self._auto_action_step in MAG_AUTO_STEPS:
+            self._update_mag_auto_action(state)
         else:
             self._update_accel_auto_action(state)
         self._update_action_controls()
@@ -1860,10 +3188,12 @@ class QuickCalWindow(QMainWindow):
 
     @Slot(object)
     def _on_register_imu(self, frame) -> None:
+        self._ui_register_imu_frame = frame
         self._ui_register_imu_ns = time.monotonic_ns()
         for row, sample in enumerate(frame.samples):
             self.imu_table.item(row, 4).setText(f"{sample.gx}/{sample.gy}/{sample.gz}")
             self.imu_table.item(row, 5).setText(f"{sample.ax}/{sample.ay}/{sample.az}")
+        self._refresh_imu_online_status()
 
     def _refresh_imu_online_status(self, now_ns: int | None = None) -> None:
         now_ns = time.monotonic_ns() if now_ns is None else now_ns
@@ -1876,33 +3206,46 @@ class QuickCalWindow(QMainWindow):
                 item.setToolTip("USB CDC 串口尚未连接")
             self._set_badge(self.imu_badge, "IMU 未连接", "bad")
             return
+        missing_streams = []
         if self._ui_raw_imu_frame is None or self._ui_raw_imu_ns == 0:
-            text, color = "等待 type=9", "#b45309"
+            missing_streams.append("type=9")
+        if self._ui_register_imu_frame is None or self._ui_register_imu_ns == 0:
+            missing_streams.append("type=11")
+        if missing_streams:
+            stream_text = "/".join(missing_streams)
+            text, color = f"等待 {stream_text}", "#b45309"
             for row in range(len(IMU_NAMES)):
                 item = self.imu_table.item(row, 1)
                 item.setText(text)
                 item.setForeground(QColor(color))
-                item.setToolTip("串口已打开，但尚未收到 type=9 工程量 IMU 帧；这不等同于硬件离线")
-            self._set_badge(self.imu_badge, "等待 type=9", "warn")
+                item.setToolTip(f"r024 预检要求同时收到新鲜的 type=9 和 type=11；当前缺少 {stream_text}")
+            self._set_badge(self.imu_badge, f"等待 {stream_text}", "warn")
             return
-        age_s = (now_ns - self._ui_raw_imu_ns) / 1_000_000_000.0
-        if age_s >= self.coordinator.RAW_FRESH_NS / 1_000_000_000.0:
+        raw_age_s = (now_ns - self._ui_raw_imu_ns) / 1_000_000_000.0
+        register_age_s = (now_ns - self._ui_register_imu_ns) / 1_000_000_000.0
+        if max(raw_age_s, register_age_s) >= self.coordinator.RAW_FRESH_NS / 1_000_000_000.0:
             for row in range(len(IMU_NAMES)):
                 item = self.imu_table.item(row, 1)
                 item.setText("数据超时")
                 item.setForeground(QColor("#b42318"))
-                item.setToolTip(f"最后一帧 type=9 距今 {age_s:.2f} 秒")
+                item.setToolTip(
+                    f"type=9 龄期 {raw_age_s:.2f}s；type=11 龄期 {register_age_s:.2f}s；允许 <0.80s"
+                )
             self._set_badge(self.imu_badge, "IMU 数据超时", "bad")
             return
-        presence_mask = self._ui_raw_imu_frame.presence_mask & ALL_IMU_MASK
+        raw_mask = self._ui_raw_imu_frame.presence_mask & ALL_IMU_MASK
+        register_mask = self._ui_register_imu_frame.presence_mask & ALL_IMU_MASK
+        presence_mask = raw_mask & register_mask
         for row in range(len(IMU_NAMES)):
             online = bool(presence_mask & (1 << row))
             item = self.imu_table.item(row, 1)
             item.setText("在线" if online else "离线")
             item.setForeground(QColor("#087f5b" if online else "#dc2626"))
             item.setToolTip(
-                f"type=9 数据新鲜，presence_mask=0x{presence_mask:04X}，bit {row}="
-                f"{1 if online else 0}"
+                f"type=9 mask=0x{raw_mask:04X}, stage=0x{self._ui_raw_imu_frame.stage_id:02X}, "
+                f"capture=0x{self._ui_raw_imu_frame.capture_mask:02X}；"
+                f"type=11 mask=0x{register_mask:04X}, stage=0x{self._ui_register_imu_frame.stage_id:02X}, "
+                f"capture=0x{self._ui_register_imu_frame.capture_mask:02X}"
             )
         online_count = presence_mask.bit_count()
         self._set_badge(self.imu_badge, f"IMU {online_count}/11", "ok" if online_count == 11 else "bad")
@@ -1910,52 +3253,150 @@ class QuickCalWindow(QMainWindow):
     @Slot(object)
     def _on_version(self, frame) -> None:
         self.glove_version_label.setText(f"固件：{frame.revision_tag}｜{frame.imu_model}｜{frame.hand_side}")
-        self._append_log(f"固件 {frame.revision_tag}，构建 {frame.build_date} {frame.build_time}")
+        self._append_log(
+            f"固件 {frame.revision_tag}，revision={frame.revision}，features=0x{frame.features:02X}，"
+            f"原始流能力={'有' if frame.factory_raw_streams else '无'}，构建 {frame.build_date} {frame.build_time}"
+        )
+
+    @staticmethod
+    def _format_report_summary(report) -> str:
+        gyro_ok_count = sum(
+            1
+            for item in report.gyro_quality
+            if item.ok
+            and item.reject_flags == 0
+            and item.window_count >= EXPECTED_GYRO_SEGMENTS
+        )
+        accel_ok_count = sum(1 for item in report.accel_quality if item.ok)
+        imu_count = report.imu_count
+
+        if report.factory_pass:
+            outcome = "通过"
+        elif report.status == 0:
+            outcome = "未通过：报告质量项不完整"
+        else:
+            reason = MCAL_STATUS_LABELS.get(report.status, "固件报告失败")
+            outcome = f"未通过：{reason}"
+
+        gyro_text = f"Gyro={gyro_ok_count}/{imu_count}"
+        if report.calibrated_count != gyro_ok_count:
+            gyro_text += f"（报告头 nCal={report.calibrated_count}）"
+        accel_text = f"Accel={accel_ok_count}/{imu_count}"
+
+        if report.status == 0:
+            flash_text = f"Flash 已写入（calSeq={report.flash_sequence}）"
+        else:
+            flash_text = f"本次 Flash 未写入｜当前 calSeq={report.flash_sequence}"
+        rms_text = (
+            f"平均 RMS={report.mean_rms_mdeg / 1000:.3f}°"
+            if report.gyro_all_ok
+            else "平均 RMS=--"
+        )
+        return (
+            f"报告 v{report.version}｜{outcome}（status={report.status}）｜"
+            f"{gyro_text}｜{accel_text}｜{flash_text}｜{rms_text}"
+        )
 
     @Slot(object)
     def _on_report(self, report) -> None:
-        self.report_summary.setText(
-            f"报告 v{report.version}｜status={report.status}｜Gyro={report.calibrated_count}/{report.imu_count}｜"
-            f"Accel={'11/11' if report.accel_all_ok else '未全通过'}｜Flash seq={report.flash_sequence}｜"
-            f"平均 RMS={report.mean_rms_mdeg / 1000:.3f}°"
-        )
+        self.report_summary.setText(self._format_report_summary(report))
         for row in range(11):
             gyro = report.gyro_quality[row] if row < len(report.gyro_quality) else None
             accel = report.accel_quality[row] if row < len(report.accel_quality) else None
+            gyro_passed = bool(
+                gyro
+                and gyro.ok
+                and gyro.reject_flags == 0
+                and gyro.window_count >= EXPECTED_GYRO_SEGMENTS
+            )
+            gyro_reasons = list(gyro.reject_reasons) if gyro else []
+            if (
+                gyro
+                and gyro.window_count < EXPECTED_GYRO_SEGMENTS
+                and "有效窗口不足" not in gyro_reasons
+            ):
+                gyro_reasons.append("有效窗口不足")
             values = (
-                "通过" if gyro and gyro.ok else "失败",
+                "通过" if gyro_passed else "失败",
+                "、".join(gyro_reasons) if gyro_reasons else ("—" if gyro else "--"),
                 f"{gyro.rms_mdeg / 1000:.3f}" if gyro else "--",
                 str(gyro.window_count) if gyro else "--",
-                str(gyro.max_off_axis) if gyro else "--",
+                f"{gyro.max_off_axis / 1000:.3f}" if gyro else "--",
                 "通过" if accel and accel.ok else "失败",
+                (
+                    f"残差={accel.residual_x1000 / 1000:.3f}；"
+                    f"比例={accel.max_abs_scale_error_x1000 / 1000:.3f}；"
+                    f"交叉轴={accel.max_cross_axis_x1000 / 1000:.3f}；"
+                    f"Bias=({accel.bias_x_mg},{accel.bias_y_mg},{accel.bias_z_mg})mg"
+                    if accel
+                    else "--"
+                ),
             )
             for column, value in enumerate(values, 1):
                 self.report_table.item(row, column).setText(value)
-            passed = bool(gyro and gyro.ok and accel and accel.ok)
+            passed = bool(gyro_passed and accel and accel.ok)
             self.imu_table.item(row, 6).setText("通过" if passed else "失败")
             self.imu_table.item(row, 6).setForeground(QColor("#087f5b" if passed else "#dc2626"))
 
     @Slot(str)
     def _on_run_state(self, state: str) -> None:
-        if self._auto_action_step == "G01":
-            if state == RunState.CAPTURING.value and self._g01_phase == "wait_stage_open":
-                self._g01_phase = "capturing"
-            elif state == RunState.WAIT_STAGE_CLOSE.value and self._g01_phase in (
+        if self._auto_action_step in GYRO_AUTO_STEPS:
+            if (
+                state == RunState.CAPTURING.value
+                and self._gyro_x_phase == "wait_stage_open"
+            ):
+                self._gyro_x_phase = "capturing"
+            elif state == RunState.WAIT_STAGE_CLOSE.value and self._gyro_x_phase in (
                 "wait_stage_open",
                 "capturing",
             ):
-                self._stop_g01_jog()
-                self._g01_phase = "wait_jog_stop"
-                self._g01_phase_started_ns = time.monotonic_ns()
+                # The fitted six-second window has ended. Start reducing jog
+                # speed immediately so the complete move remains inside the
+                # fixed ten-degree outer deceleration region while the close
+                # ACK is in flight.
+                self._gyro_x_phase = "smooth_decel"
+                self._gyro_x_phase_started_ns = time.monotonic_ns()
+                if not self._set_gyro_x_decel_level(0):
+                    self._fail_gyro_x_auto_action(
+                        f"{self._auto_action_step} 无法开始丝滑减速，已停止机械臂"
+                    )
+        elif self._auto_action_step in MAG_AUTO_STEPS:
+            if (
+                state == RunState.CAPTURING.value
+                and self._mag_phase == "wait_stage_open"
+            ):
+                self._mag_phase = (
+                    "static_capturing"
+                    if self._auto_action_step == "M04"
+                    else "capturing"
+                )
+                self._mag_phase_started_ns = time.monotonic_ns()
+            elif state == RunState.WAIT_STAGE_CLOSE.value and self._mag_phase in (
+                "wait_stage_open",
+                "capturing",
+                "static_capturing",
+            ):
+                self._stop_mag_jog(restore_speed=False)
+                self._mag_phase = "wait_jog_stop"
+                self._mag_phase_started_ns = time.monotonic_ns()
         if self._auto_action_step is not None and state in (
             RunState.ABORTED.value,
             RunState.COMPLETE.value,
         ):
             step_id = self._auto_action_step
-            if step_id == "G01":
-                self._stop_g01_jog()
-                self._g01_phase = ""
-                self._g01_reference_pose = None
+            if step_id in GYRO_AUTO_STEPS:
+                self._stop_gyro_x_jog()
+                self._gyro_x_phase = ""
+                self._gyro_x_reference_pose = None
+            elif step_id in MAG_AUTO_STEPS:
+                self._stop_mag_jog(restore_speed=False)
+                self._mag_original_speed_factor = 0
+                self._mag_speed_factor = 0
+                self._mag_speed_source = ""
+                self._mag_phase = ""
+                self._mag_phase_started_ns = 0
+                self._mag_segment_index = -1
+                self._mag_reference_pose = None
             self._finish_auto_action(f"会话已结束，{step_id} 自动动作状态已清除", "error")
         badge_state = "ok" if state == RunState.COMPLETE.value else "warn" if state in (RunState.IDLE.value, RunState.READY.value) else "bad" if state == RunState.ABORTED.value else "warn"
         self._set_badge(self.session_badge, state, badge_state)
@@ -1974,6 +3415,16 @@ class QuickCalWindow(QMainWindow):
             if step.step_id == "P1"
             else "自动复原并执行 G01"
             if step.step_id == "G01"
+            else (
+                f"自动执行 {step.step_id} Tool "
+                f"{action_config.axis}"
+                f"{'+' if action_config.degrees > 0 else '-'} 扫转"
+            )
+            if step.step_id in GYRO_AUTO_STEPS and action_config is not None
+            else f"{step.step_id} 轴映射配置无效"
+            if step.step_id in GYRO_AUTO_STEPS
+            else MAG_STEP_BUTTON_TEXT[step.step_id]
+            if step.step_id in MAG_AUTO_STEPS
             else "求解并写入设备"
             if step.step_id == "S01"
             else "完成归档"
@@ -1985,6 +3436,8 @@ class QuickCalWindow(QMainWindow):
             else "确认动作条件，执行本步"
         )
         self._update_action_controls()
+        if self._full_auto_enabled:
+            QTimer.singleShot(0, self._try_start_full_auto_step)
 
     @Slot(int, str, str)
     def _on_step_status(self, row: int, status: str, detail: str) -> None:
@@ -2010,6 +3463,7 @@ class QuickCalWindow(QMainWindow):
 
     @Slot(bool, str)
     def _on_finished(self, passed: bool, reason: str) -> None:
+        self._stop_full_auto()
         self._update_action_controls()
         QMessageBox.information(self, "QuickCal 完成" if passed else "QuickCal 未通过", reason)
 
@@ -2017,10 +3471,13 @@ class QuickCalWindow(QMainWindow):
         state = self.coordinator.state
         idle = state in (RunState.IDLE, RunState.COMPLETE, RunState.ABORTED)
         self.start_button.setEnabled(idle)
+        if self._full_auto_enabled:
+            self.confirm_button.setText("全自动流程运行中")
         self.confirm_button.setEnabled(
             state == RunState.READY
             and self.coordinator.current_step.step_id != "P1"
             and self._auto_action_step is None
+            and not self._full_auto_enabled
         )
         self.abort_button.setEnabled(self.coordinator.running)
         connection_controls = not self.coordinator.running
@@ -2066,7 +3523,17 @@ class QuickCalWindow(QMainWindow):
             self.save_action_config_button,
         ):
             widget.setEnabled(action_config_enabled)
-        manual_page_editable = connection_controls and self._auto_action_step is None
+        if self.action_step_combo.currentText() in GYRO_AUTO_STEPS:
+            # G-stage speed and timeout are governed by the fixed r024 scan
+            # controller; this page intentionally exposes only axis/direction.
+            self.action_velocity.setEnabled(False)
+            self.action_timeout.setEnabled(False)
+        manual_motion_pending = self._manual_motion_target is not None
+        manual_page_editable = (
+            connection_controls
+            and self._auto_action_step is None
+            and not manual_motion_pending
+        )
         for widget in (
             self.manual_tool_index,
             *self.manual_tool_offset_spins.values(),
@@ -2101,37 +3568,26 @@ class QuickCalWindow(QMainWindow):
     def _refresh_health(self) -> None:
         now = time.monotonic_ns()
         self._check_auto_action_timeout(now)
+        self._check_manual_motion_watchdog(now)
         self._refresh_action_preview()
         self._refresh_imu_online_status(now)
-        parts = []
         raw_age = (now - self._ui_raw_imu_ns) / 1e9 if self._ui_raw_imu_ns else math.inf
         reg_age = (now - self._ui_register_imu_ns) / 1e9 if self._ui_register_imu_ns else math.inf
         robot_age = (now - self.coordinator.latest_robot_state.received_monotonic_ns) / 1e9 if self.coordinator.latest_robot_state else math.inf
-        parts.append(
-            f"IMU 工程量（type=9）：{'正常' if raw_age < 0.8 else '等待'}（{raw_age:.2f}s）"
-            if math.isfinite(raw_age)
-            else "IMU 工程量（type=9）：等待"
-        )
-        parts.append(
-            f"IMU 寄存器原始数据（type=11）：{'正常' if reg_age < 0.8 else '等待'}（{reg_age:.2f}s）"
-            if math.isfinite(reg_age)
-            else "IMU 寄存器原始数据（type=11）：等待"
-        )
-        parts.append(
-            f"Dobot 机械臂实时反馈：{'正常' if robot_age < 1.0 else '等待'}（{robot_age:.2f}s）"
-            if math.isfinite(robot_age)
-            else "Dobot 机械臂实时反馈：等待"
-        )
         stats = self.glove.parser.stats
-        parts.append(
-            f"IMU 手套串口：有效帧={stats.accepted_frames}｜"
-            f"type=5 姿态={stats.frames_by_type.get(5, 0)}｜"
-            f"type=8 固件信息={stats.frames_by_type.get(8, 0)}｜"
-            f"type=9 工程量={stats.frames_by_type.get(9, 0)}｜"
-            f"type=11 寄存器原始数据={stats.frames_by_type.get(11, 0)}｜"
-            f"无效帧={stats.invalid_frames}｜丢失序号={stats.sequence_gaps}"
+        self.health_label.setText(
+            f"数据流：T9 {'正常' if raw_age < 0.8 else '等待'}｜"
+            f"T11 {'正常' if reg_age < 0.8 else '等待'}｜"
+            f"机械臂 {'正常' if robot_age < 1.0 else '等待'}　"
+            f"帧：有效 {stats.accepted_frames}｜异常 {stats.invalid_frames}｜丢序 {stats.sequence_gaps}"
         )
-        self.health_label.setText("　".join(parts))
+        self.health_label.setToolTip(
+            f"type=9 最近数据：{f'{raw_age:.2f}s' if math.isfinite(raw_age) else '未收到'}\n"
+            f"type=11 最近数据：{f'{reg_age:.2f}s' if math.isfinite(reg_age) else '未收到'}\n"
+            f"机械臂最近反馈：{f'{robot_age:.2f}s' if math.isfinite(robot_age) else '未收到'}\n"
+            f"type=5：{stats.frames_by_type.get(5, 0)}；type=8：{stats.frames_by_type.get(8, 0)}；"
+            f"type=9：{stats.frames_by_type.get(9, 0)}；type=11：{stats.frames_by_type.get(11, 0)}"
+        )
 
     def _append_log(self, message: str, level: str = "info") -> None:
         color = {"error": "#fca5a5", "good": "#86efac", "info": "#bfdbfe"}.get(level, "#dbeafe")
@@ -2140,8 +3596,22 @@ class QuickCalWindow(QMainWindow):
 
     def _show_error(self, message: str, modal: bool) -> None:
         self._append_log(message, "error")
+        if modal and self._full_auto_enabled and self.coordinator.running:
+            self._stop_full_auto(message, abort=True)
+            return
         if modal:
             QMessageBox.warning(self, "操作未执行", message)
+
+    def _stop_full_auto(self, reason: str = "", abort: bool = False) -> None:
+        was_enabled = self._full_auto_enabled
+        self._full_auto_enabled = False
+        self._full_auto_timer.stop()
+        self._full_auto_safe_return_started_ns = 0
+        self._full_auto_safe_return_seen_motion = False
+        if abort and self.coordinator.running:
+            if was_enabled and reason:
+                self._append_log(f"全自动流程停止：{reason}", "error")
+            self.coordinator.abort(reason or "全自动流程停止")
 
     def _confirm_abort(self, reason: str) -> None:
         if QMessageBox.question(self, "确认中止", "将立即停止机械臂、发送 MCAL_ABORT，并保留失败记录。确认继续？") == QMessageBox.StandardButton.Yes:

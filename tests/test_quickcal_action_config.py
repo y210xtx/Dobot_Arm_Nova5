@@ -79,6 +79,19 @@ class ActionConfigTests(unittest.TestCase):
         self.assertEqual(config.degrees, -180.0)
         self.assertLess(vector_angle_deg(predicted, (0.0, 0.0, -1.0)), 0.001)
 
+    def test_g01_uses_negative_y_base_before_g02_restores_negative_x_neutral(self):
+        after_rx = gravity_after_tool_rotation((0.0, 0.0, -1.0), "Rx", 90.0)
+        capture_start = gravity_after_tool_rotation(after_rx, "Rx", -45.0)
+        capture_end = gravity_after_tool_rotation(after_rx, "Rx", 45.0)
+        restored = gravity_after_tool_rotation(after_rx, "Rz", 90.0)
+
+        self.assertLess(vector_angle_deg(after_rx, (0.0, -1.0, 0.0)), 0.001)
+        self.assertAlmostEqual(after_rx[0], 0.0, places=6)
+        self.assertAlmostEqual(
+            vector_angle_deg(capture_start, capture_end), 90.0, places=6
+        )
+        self.assertLess(vector_angle_deg(restored, (-1.0, 0.0, 0.0)), 0.001)
+
     def test_action_config_round_trip(self):
         expected = RobotActionConfig(True, "Rz", -90.0, 4, 45.0)
         with tempfile.TemporaryDirectory() as directory:
@@ -88,11 +101,28 @@ class ActionConfigTests(unittest.TestCase):
         self.assertEqual(loaded["A01"], expected)
         self.assertEqual(loaded["A02"], DEFAULT_ACTIONS["A02"])
 
+    def test_default_gyro_actions_match_diagnosed_tool_axis_mapping(self):
+        self.assertEqual(
+            {
+                step_id: (DEFAULT_ACTIONS[step_id].axis, DEFAULT_ACTIONS[step_id].degrees)
+                for step_id in ("G01", "G02", "G03", "G04", "G05", "G06")
+            },
+            {
+                "G01": ("Rx", 90.0),
+                "G02": ("Rx", -90.0),
+                "G03": ("Ry", 150.0),
+                "G04": ("Ry", -150.0),
+                "G05": ("Rz", 150.0),
+                "G06": ("Rz", -150.0),
+            },
+        )
+
     def test_action_config_rejects_unsafe_values(self):
         with self.assertRaises(ValueError):
             RobotActionConfig(degrees=181.0)
         with self.assertRaises(ValueError):
-            RobotActionConfig(velocity_percent=81)
+            RobotActionConfig(velocity_percent=101)
+        self.assertEqual(RobotActionConfig(velocity_percent=100).velocity_percent, 100)
 
 
 if __name__ == "__main__":

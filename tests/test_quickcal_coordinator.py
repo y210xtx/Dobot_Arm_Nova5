@@ -13,10 +13,13 @@ try:
         AckFrame,
         CMD_MCAL_ABORT,
         CMD_MCAL_BEGIN,
+        CMD_MCAL_COMMIT,
         CMD_MCAL_STAGE,
-        MCAL_CAPTURE_MAG,
         ImuSample,
         RawImuFrame,
+        RegisterImuSample,
+        RegisterRawImuFrame,
+        VersionFrame,
     )
     from imu_calibration.quickcal_station.robot_device import RobotState
 except ModuleNotFoundError as exc:
@@ -25,8 +28,9 @@ except ModuleNotFoundError as exc:
     QCoreApplication = None
     QuickCalCoordinator = RunState = RobotState = None
     AckFrame = None
-    CMD_MCAL_ABORT = CMD_MCAL_BEGIN = CMD_MCAL_STAGE = MCAL_CAPTURE_MAG = None
+    CMD_MCAL_ABORT = CMD_MCAL_BEGIN = CMD_MCAL_COMMIT = CMD_MCAL_STAGE = None
     ALL_IMU_MASK = ImuSample = RawImuFrame = None
+    RegisterImuSample = RegisterRawImuFrame = VersionFrame = None
 from imu_calibration.quickcal_station.workflow import YawLimits
 
 
@@ -77,19 +81,32 @@ class CoordinatorCompatibilityTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QCoreApplication.instance() or QCoreApplication([])
 
-    def test_type9_and_type11_are_optional_diagnostics(self):
+    @staticmethod
+    def _prime_raw_streams(coordinator, stage_id=0, capture_mask=0):
+        engineering = ImuSample(0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+        registers = RegisterImuSample(0, 0, 0, 0, 0, 16384)
+        coordinator.on_raw_imu(
+            RawImuFrame(1, 1, ALL_IMU_MASK, stage_id, capture_mask, (engineering,) * 11)
+        )
+        coordinator.on_register_raw_imu(
+            RegisterRawImuFrame(
+                1, 1, ALL_IMU_MASK, 0, 0, stage_id, capture_mask, (registers,) * 11
+            )
+        )
+
+    def test_type9_and_type11_are_mandatory_r024_inputs(self):
         glove = FakeGlove()
         robot = FakeRobot()
         coordinator = QuickCalCoordinator(glove, robot)
-        coordinator.version = SimpleNamespace(
+        coordinator.version = VersionFrame(
             payload_version=1,
-            revision=6,
-            revision_tag="r006-LSM6DSV16X",
+            revision=24,
+            revision_tag="r024-fac-rawq",
+            build_date="2026-08-27",
+            build_time="11:00:00",
             imu_model="LSM6DSV16X",
             hand_side="right",
-            features=0x60,
-            factory_intrinsic=True,
-            accel_intrinsic=True,
+            features=0xE0,
             payload=bytes(48),
         )
         coordinator.latest_robot_state = RobotState(
@@ -110,6 +127,8 @@ class CoordinatorCompatibilityTests(unittest.TestCase):
                 "SN001", "QC-01", "tester", Path(directory), YawLimits(), True,
                 neutral_pose=(0.0,) * 6,
             )
+            self.assertTrue(any("type=9" in error for error in coordinator.preflight_errors()))
+            self._prime_raw_streams(coordinator)
             self.assertEqual(coordinator.preflight_errors(), [])
             self.assertTrue(coordinator.start_session())
             self.assertEqual(coordinator.state, RunState.WAIT_BEGIN_ACK)
@@ -152,6 +171,7 @@ class CoordinatorCompatibilityTests(unittest.TestCase):
             digital_outputs=0,
         )
         coordinator.condition_stable_since_ns = time.monotonic_ns() - 2_100_000_000
+        self._prime_raw_streams(coordinator)
 
         coordinator._tick()
 
@@ -164,26 +184,33 @@ class CoordinatorCompatibilityTests(unittest.TestCase):
         robot = FakeRobot()
         coordinator = QuickCalCoordinator(glove, robot)
         still = ImuSample(0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
-        rotating = ImuSample(0.06, 0.0, 0.0, 0.0, 0.0, 1.0)
+        below_new_limit = ImuSample(0.099, 0.0, 0.0, 0.0, 0.0, 1.0)
+        rotating = ImuSample(0.101, 0.0, 0.0, 0.0, 0.0, 1.0)
         vibrating = ImuSample(0.0, 0.0, 0.0, 0.1, 0.0, 0.995)
 
         self.assertEqual(
             coordinator._evaluate_p1_imu_frame(
-                RawImuFrame(1, 1, ALL_IMU_MASK, (still,) * 11)
+                RawImuFrame(1, 1, ALL_IMU_MASK, 0, 0, (still,) * 11)
+            ),
+            "",
+        )
+        self.assertEqual(
+            coordinator._evaluate_p1_imu_frame(
+                RawImuFrame(2, 1, ALL_IMU_MASK, 0, 0, (below_new_limit,) + (still,) * 10)
             ),
             "",
         )
         self.assertIn(
             "检测到转动",
             coordinator._evaluate_p1_imu_frame(
-                RawImuFrame(2, 1, ALL_IMU_MASK, (rotating,) + (still,) * 10)
+                RawImuFrame(3, 1, ALL_IMU_MASK, 0, 0, (rotating,) + (still,) * 10)
             ),
         )
         coordinator.p1_previous_accel = ((0.0, 0.0, 1.0),) * 11
         self.assertIn(
             "检测到振动",
             coordinator._evaluate_p1_imu_frame(
-                RawImuFrame(3, 1, ALL_IMU_MASK, (vibrating,) + (still,) * 10)
+                RawImuFrame(4, 1, ALL_IMU_MASK, 0, 0, (vibrating,) + (still,) * 10)
             ),
         )
         coordinator.tick_timer.stop()
@@ -241,7 +268,7 @@ class CoordinatorCompatibilityTests(unittest.TestCase):
         self.assertGreater(result[0], QuickCalCoordinator.ACCEL_FACE_WARNING_DEG)
         self.assertLess(result[0], QuickCalCoordinator.ACCEL_FACE_MAX_DEG)
 
-    def test_gyro_direction_gates_follow_excel_work_order(self):
+    def test_gyro_direction_gates_follow_configured_r024_axis_mapping(self):
         glove = FakeGlove()
         robot = FakeRobot()
         coordinator = QuickCalCoordinator(glove, robot)
@@ -272,43 +299,63 @@ class CoordinatorCompatibilityTests(unittest.TestCase):
                 self.assertEqual(coordinator._gyro_motion_error(steps[step_id], state), "")
         coordinator.tick_timer.stop()
 
-    def test_g01_jog_mode_can_open_and_continue_dynamic_capture(self):
-        glove = FakeGlove()
-        robot = FakeRobot()
-        coordinator = QuickCalCoordinator(glove, robot)
-        coordinator.current_index = next(
-            index for index, step in enumerate(coordinator.steps) if step.step_id == "G01"
-        )
-        coordinator.state = RunState.READY
-        coordinator.latest_robot_state = RobotState(
-            received_monotonic_ns=time.monotonic_ns(),
-            controller_timestamp=1,
-            mode=8,
-            speed_scaling=15.0,
-            joints=(0.0,) * 6,
-            pose=(0.0,) * 6,
-            tcp_speed=(0.0, 0.0, 0.0, 15.0, 0.0, 0.0),
-            user=0,
-            tool=1,
-            digital_inputs=0,
-            digital_outputs=0,
-        )
-        coordinator.condition_stable_since_ns = time.monotonic_ns() - 1_100_000_000
+    def test_all_gyro_jog_modes_can_open_and_continue_dynamic_capture(self):
+        rates = {
+            "G01": (15.0, 0.0, 0.0),
+            "G02": (-15.0, 0.0, 0.0),
+            "G03": (0.0, 15.0, 0.0),
+            "G04": (0.0, -15.0, 0.0),
+            "G05": (0.0, 0.0, 15.0),
+            "G06": (0.0, 0.0, -15.0),
+        }
+        for step_id, angular_speed in rates.items():
+            with self.subTest(step_id=step_id):
+                glove = FakeGlove()
+                robot = FakeRobot()
+                coordinator = QuickCalCoordinator(glove, robot)
+                coordinator.current_index = next(
+                    index
+                    for index, step in enumerate(coordinator.steps)
+                    if step.step_id == step_id
+                )
+                coordinator.state = RunState.READY
+                coordinator.neutral_pose = (0.0,) * 6
+                coordinator.latest_robot_state = RobotState(
+                    received_monotonic_ns=time.monotonic_ns(),
+                    controller_timestamp=1,
+                    mode=8,
+                    speed_scaling=15.0,
+                    joints=(0.0,) * 6,
+                    pose=(0.0,) * 6,
+                    tcp_speed=(0.0, 0.0, 0.0, *angular_speed),
+                    user=0,
+                    tool=1,
+                    digital_inputs=0,
+                    digital_outputs=0,
+                )
+                coordinator.condition_stable_since_ns = (
+                    time.monotonic_ns() - 1_100_000_000
+                )
+                self._prime_raw_streams(coordinator)
 
-        self.assertTrue(coordinator.confirm_current_action())
-        self.assertEqual(coordinator.state, RunState.WAIT_STAGE_OPEN)
-        step = coordinator.current_step
-        self.assertEqual(
-            glove.commands[-1],
-            (CMD_MCAL_STAGE, step.stage_code, bytes((step.capture_mask,))),
-        )
-        coordinator.on_ack(
-            AckFrame(CMD_MCAL_STAGE, 0, step.stage_code, step.capture_mask, 1)
-        )
-        self.assertEqual(coordinator.state, RunState.CAPTURING)
-        self.assertEqual(coordinator._live_capture_fault(time.monotonic_ns()), "")
-        coordinator.abort("test cleanup")
-        coordinator.tick_timer.stop()
+                self.assertTrue(coordinator.confirm_current_action())
+                self.assertEqual(coordinator.state, RunState.WAIT_STAGE_OPEN)
+                step = coordinator.current_step
+                self.assertEqual(
+                    glove.commands[-1],
+                    (CMD_MCAL_STAGE, step.stage_code, bytes((step.capture_mask,))),
+                )
+                coordinator.on_ack(
+                    AckFrame(
+                        CMD_MCAL_STAGE, 0, step.stage_code, step.capture_mask, 1
+                    )
+                )
+                self.assertEqual(coordinator.state, RunState.CAPTURING)
+                self.assertEqual(
+                    coordinator._live_capture_fault(time.monotonic_ns()), ""
+                )
+                coordinator.abort("test cleanup")
+                coordinator.tick_timer.stop()
 
     def test_collision_mode_is_rejected_and_aborts_running_session(self):
         glove = FakeGlove()
@@ -343,49 +390,74 @@ class CoordinatorCompatibilityTests(unittest.TestCase):
         self.assertEqual(glove.commands[-1][0], CMD_MCAL_ABORT)
         coordinator.tick_timer.stop()
 
-    def test_m04_is_a_formal_fifteen_second_magnetic_stage(self):
+    def test_g06_advances_directly_to_commit_without_magnetic_stages(self):
         glove = FakeGlove()
         robot = FakeRobot()
         coordinator = QuickCalCoordinator(glove, robot)
-        coordinator.neutral_pose = (0.0,) * 6
-        coordinator.environment_confirmed = True
-        coordinator.current_index = next(
-            index for index, step in enumerate(coordinator.steps) if step.step_id == "M04"
+        g06_index = next(
+            index
+            for index, step in enumerate(coordinator.steps)
+            if step.step_id == "G06"
         )
-        coordinator.latest_robot_state = RobotState(
-            received_monotonic_ns=time.monotonic_ns(),
-            controller_timestamp=1,
-            mode=7,
-            speed_scaling=1.0,
-            joints=(0.0,) * 6,
-            pose=(0.0,) * 6,
-            tcp_speed=(0.0, 0.0, 0.0, 2.0, 2.0, 0.0),
-            user=0,
-            tool=0,
-            digital_inputs=0,
-            digital_outputs=0,
-        )
-        coordinator.condition_stable_since_ns = time.monotonic_ns() - 400_000_000
+        coordinator.current_index = g06_index
+        for index in range(1, g06_index + 1):
+            coordinator.step_status[index] = "完成"
 
-        self.assertEqual(coordinator._check_motion_condition(coordinator.current_step), "")
-        coordinator.state = RunState.READY
-        self.assertTrue(coordinator.confirm_current_action())
-        self.assertEqual(glove.commands[-1], (CMD_MCAL_STAGE, 0x33, bytes((MCAL_CAPTURE_MAG,))))
-        coordinator.on_ack(AckFrame(CMD_MCAL_STAGE, 0, 0x33, MCAL_CAPTURE_MAG, 1))
-        self.assertEqual(coordinator.state, RunState.CAPTURING)
-        coordinator.motion_coverage["x_positive"] = True
-        coordinator.motion_coverage["y_negative"] = True
-        coordinator._request_stage_close()
-        coordinator.on_ack(AckFrame(CMD_MCAL_STAGE, 0, 0x33, 11, 2))
+        coordinator._advance()
+
+        self.assertTrue(coordinator.SKIP_MAGNETIC_STAGES)
         self.assertEqual(coordinator.current_step.step_id, "S01")
-        self.assertEqual(coordinator.valid_mag_pairs_this_step, 0)
+        self.assertFalse(any(step.step_id.startswith("M") for step in coordinator.steps))
         coordinator.tick_timer.stop()
 
-    def test_roll_pitch_rate_does_not_follow_yaw_setting(self):
+    def test_r024_workflow_contains_exactly_thirteen_formal_stages(self):
         glove = FakeGlove()
         robot = FakeRobot()
         coordinator = QuickCalCoordinator(glove, robot)
-        coordinator.limits = YawLimits(rate_deg_s=10.0)
+        formal = [step.stage_code for step in coordinator.steps if step.stage_code is not None]
+        self.assertEqual(formal, [0x01, *range(0x10, 0x16), *range(0x20, 0x26)])
+        coordinator.tick_timer.stop()
+
+    def test_failed_commit_ack_still_consumes_type7_diagnostics(self):
+        glove = FakeGlove()
+        robot = FakeRobot()
+        coordinator = QuickCalCoordinator(glove, robot)
+        coordinator.current_index = next(
+            index for index, step in enumerate(coordinator.steps) if step.step_id == "S01"
+        )
+        coordinator.state = RunState.WAIT_COMMIT_ACK
+        coordinator.on_ack(AckFrame(CMD_MCAL_COMMIT, 11, 7, 11, 22))
+        self.assertEqual(coordinator.state, RunState.WAIT_REPORT)
+
+        report = SimpleNamespace(
+            factory_pass=False,
+            version=3,
+            status=11,
+            gyro_quality=(
+                SimpleNamespace(
+                    ok=False,
+                    reject_flags=0x01,
+                    reject_reasons=("有效窗口不足",),
+                    window_count=23,
+                    rms_mdeg=6100,
+                    max_off_axis=12,
+                ),
+            ),
+            accel_quality=(),
+            payload=b"",
+        )
+        coordinator.on_mcal_report(report)
+
+        self.assertEqual(coordinator.state, RunState.ABORTED)
+        self.assertEqual(glove.commands[-1][0], CMD_MCAL_ABORT)
+        self.assertIn("有效窗口不足", coordinator.step_detail[coordinator.current_index])
+        coordinator.tick_timer.stop()
+
+    def test_all_gyro_steps_use_fixed_fifteen_degree_rate(self):
+        glove = FakeGlove()
+        robot = FakeRobot()
+        coordinator = QuickCalCoordinator(glove, robot)
+        coordinator.limits = YawLimits()
         steps = {step.step_id: step for step in coordinator.steps}
         state = RobotState(
             received_monotonic_ns=time.monotonic_ns(),
@@ -402,40 +474,79 @@ class CoordinatorCompatibilityTests(unittest.TestCase):
         )
 
         self.assertEqual(coordinator._gyro_motion_error(steps["G01"], state), "")
-        self.assertIn("+10.0°/s", coordinator._gyro_motion_error(steps["G05"], state))
+        slow_x_state = RobotState(
+            received_monotonic_ns=time.monotonic_ns(),
+            controller_timestamp=1,
+            mode=7,
+            speed_scaling=1.0,
+            joints=(0.0,) * 6,
+            pose=(0.0,) * 6,
+            tcp_speed=(0.0, 0.0, 0.0, 10.0, 0.0, 0.0),
+            user=0,
+            tool=0,
+            digital_inputs=0,
+            digital_outputs=0,
+        )
+        self.assertIn(
+            "+15.0°/s",
+            coordinator._gyro_motion_error(steps["G01"], slow_x_state),
+        )
+        z_state = RobotState(
+            received_monotonic_ns=time.monotonic_ns(),
+            controller_timestamp=1,
+            mode=7,
+            speed_scaling=1.0,
+            joints=(0.0,) * 6,
+            pose=(0.0,) * 6,
+            tcp_speed=(0.0, 0.0, 0.0, 0.0, 0.0, 15.0),
+            user=0,
+            tool=0,
+            digital_inputs=0,
+            digital_outputs=0,
+        )
+        self.assertEqual(coordinator._gyro_motion_error(steps["G05"], z_state), "")
         coordinator.tick_timer.stop()
 
-    def test_magnetic_coverage_requires_at_least_two_tool_axes(self):
+    def test_limited_gyro_angle_uses_runtime_negative_y_reference(self):
+        coordinator = QuickCalCoordinator(FakeGlove(), FakeRobot())
+        coordinator.neutral_pose = (0.0,) * 6
+        runtime_reference = (0.0, 0.0, 0.0, 30.0, 0.0, 0.0)
+        coordinator.gyro_limited_reference_pose = runtime_reference
+        coordinator.current_index = next(
+            index
+            for index, step in enumerate(coordinator.steps)
+            if step.step_id == "G01"
+        )
+
+        self.assertAlmostEqual(
+            coordinator._relative_tool_axis_deg(runtime_reference, "Rx"), 0.0
+        )
+        coordinator.gyro_limited_reference_pose = None
+        self.assertAlmostEqual(
+            coordinator._relative_tool_axis_deg(runtime_reference, "Rx"), 30.0
+        )
+        coordinator.tick_timer.stop()
+
+    def test_magnetic_coverage_matches_each_work_order_action(self):
         glove = FakeGlove()
         robot = FakeRobot()
         coordinator = QuickCalCoordinator(glove, robot)
         coordinator.neutral_pose = (0.0,) * 6
-        coordinator.current_index = next(
-            index for index, step in enumerate(coordinator.steps) if step.step_id == "M02"
-        )
         coordinator._reset_motion_coverage()
+        for key in ("x_positive", "x_negative", "y_positive", "y_negative"):
+            coordinator.motion_coverage[key] = True
+        self.assertEqual(coordinator._motion_coverage_error("M01"), "")
+        coordinator.motion_coverage["y_negative"] = False
+        self.assertIn("Tool Rx/Ry", coordinator._motion_coverage_error("M01"))
 
-        for angular_speed in ((2.0, 0.0, 0.0), (0.0, -2.0, 0.0)):
-            state = RobotState(
-                received_monotonic_ns=time.monotonic_ns(),
-                controller_timestamp=1,
-                mode=7,
-                speed_scaling=1.0,
-                joints=(0.0,) * 6,
-                pose=(0.0,) * 6,
-                tcp_speed=(0.0, 0.0, 0.0, *angular_speed),
-                user=0,
-                tool=0,
-                digital_inputs=0,
-                digital_outputs=0,
-            )
-            coordinator.latest_robot_state = state
-            coordinator._update_motion_coverage(state)
-
+        coordinator._reset_motion_coverage()
+        coordinator.motion_coverage["z_positive"] = True
+        coordinator.motion_coverage["z_negative"] = True
         self.assertEqual(coordinator._motion_coverage_error("M02"), "")
-        coordinator._reset_motion_coverage()
-        coordinator.motion_coverage["x_positive"] = True
-        self.assertIn("至少需要两个旋转轴", coordinator._motion_coverage_error("M02"))
+        self.assertEqual(coordinator._motion_coverage_error("M03"), "")
+        coordinator.motion_coverage["z_negative"] = False
+        self.assertIn("Tool Rz", coordinator._motion_coverage_error("M02"))
+        self.assertEqual(coordinator._motion_coverage_error("M04"), "")
         coordinator.tick_timer.stop()
 
 

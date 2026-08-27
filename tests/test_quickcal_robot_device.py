@@ -23,6 +23,10 @@ class FakeDashboard:
         self.calls.append(("MovL", pose, options))
         return "0,{}"
 
+    def MovJ(self, *pose, **options):
+        self.calls.append(("MovJ", pose, options))
+        return "0,{}"
+
     def SpeedFactor(self, percent):
         self.calls.append(("SpeedFactor", percent))
         return "0,{}"
@@ -61,14 +65,25 @@ class RobotDeviceTests(unittest.TestCase):
         self.assertEqual(dashboard.calls[0][1]["cp"], 100)
         self.assertEqual(dashboard.calls[1][1]["cp"], 0)
 
-    def test_relative_rotation_velocity_is_capped_at_eighty_percent(self):
+    def test_relative_rotation_velocity_is_capped_at_full_speed(self):
         dashboard = FakeDashboard()
         robot = RobotDevice()
         robot.dashboard = dashboard
 
-        self.assertTrue(robot.relative_tool_rotation("Rz", 90.0, 100))
+        self.assertTrue(robot.relative_tool_rotation("Rz", 90.0, 150))
 
-        self.assertEqual(dashboard.calls[0][1]["v"], 80)
+        self.assertEqual(dashboard.calls[0][1]["v"], 100)
+
+    def test_pose_and_joint_moves_are_capped_at_full_speed(self):
+        dashboard = FakeDashboard()
+        robot = RobotDevice()
+        robot.dashboard = dashboard
+
+        self.assertTrue(robot.move_pose_j((0.0,) * 6, 150, user=0, tool=1))
+        self.assertTrue(robot.move_joints((0.0,) * 6, 150))
+
+        self.assertEqual(dashboard.calls[0][2]["v"], 100)
+        self.assertEqual(dashboard.calls[1][2]["v"], 100)
 
     def test_negative_half_turn_keeps_reverse_direction_in_both_segments(self):
         dashboard = FakeDashboard()
@@ -80,6 +95,20 @@ class RobotDeviceTests(unittest.TestCase):
         self.assertEqual(len(dashboard.calls), 2)
         self.assertEqual([call[0][5] for call in dashboard.calls], [-90.0, -90.0])
         self.assertEqual([call[1]["cp"] for call in dashboard.calls], [100, 0])
+
+    def test_relative_rotation_accepts_lower_acceleration_for_smooth_endpoint(self):
+        dashboard = FakeDashboard()
+        robot = RobotDevice()
+        robot.dashboard = dashboard
+
+        self.assertTrue(
+            robot.relative_tool_rotation(
+                "Ry", 8.0, velocity_percent=15, acceleration_percent=5
+            )
+        )
+
+        self.assertEqual(dashboard.calls[0][1]["v"], 15)
+        self.assertEqual(dashboard.calls[0][1]["a"], 5)
 
     def test_tool_jog_sets_speed_and_uses_tool_coordinates(self):
         dashboard = FakeDashboard()
@@ -95,6 +124,46 @@ class RobotDeviceTests(unittest.TestCase):
             ("MoveJog", "Rx+", {"coordtype": 2, "user": 0, "tool": 1}),
         )
         self.assertEqual(dashboard.calls[2], ("MoveJog", "", {}))
+
+    def test_tool_jog_supports_all_rotation_axes_and_directions(self):
+        for axis in ("Rx", "Ry", "Rz"):
+            for positive in (True, False):
+                with self.subTest(axis=axis, positive=positive):
+                    dashboard = FakeDashboard()
+                    robot = RobotDevice()
+                    robot.dashboard = dashboard
+
+                    self.assertTrue(
+                        robot.start_tool_jog(axis, positive, 15, user=0, tool=1)
+                    )
+
+                    self.assertEqual(dashboard.calls[0], ("SpeedFactor", 15))
+                    self.assertEqual(
+                        dashboard.calls[1],
+                        (
+                            "MoveJog",
+                            f"{axis}{'+' if positive else '-'}",
+                            {"coordtype": 2, "user": 0, "tool": 1},
+                        ),
+                    )
+
+    def test_switch_tool_jog_reuses_existing_speed_factor(self):
+        dashboard = FakeDashboard()
+        robot = RobotDevice()
+        robot.dashboard = dashboard
+
+        self.assertTrue(robot.switch_tool_jog("Ry", False, user=0, tool=1))
+
+        self.assertEqual(
+            dashboard.calls,
+            [
+                (
+                    "MoveJog",
+                    "Ry-",
+                    {"coordtype": 2, "user": 0, "tool": 1},
+                )
+            ],
+        )
 
     def test_tool_frame_is_saved_before_being_activated(self):
         dashboard = FakeDashboard()

@@ -35,11 +35,24 @@ MCAL_CAPTURE_GYRO_M = 0x04
 MCAL_CAPTURE_MAG = 0x08
 
 ALL_IMU_MASK = 0x07FF
-MAX_PAYLOAD_LENGTH = 256 * 1024
+MAX_PAYLOAD_LENGTH = 4096
 EXPECTED_VERSION_PAYLOAD_VERSION = 1
-EXPECTED_MCAL_REPORT_VERSION = 2
+EXPECTED_FIRMWARE_REVISION = 24
+EXPECTED_FIRMWARE_TAG = "r024-fac-rawq"
+EXPECTED_MCAL_REPORT_VERSION = 3
 EXPECTED_MCAL_PAYLOAD_LENGTH = 1046
-EXPECTED_GYRO_SEGMENTS = 6
+EXPECTED_GYRO_SEGMENTS = 40
+
+GYRO_REJECT_INSUFFICIENT = 0x01
+GYRO_REJECT_SOLVER = 0x02
+GYRO_REJECT_RMS = 0x04
+GYRO_REJECT_CROSS_AXIS = 0x08
+GYRO_REJECT_LABELS = {
+    GYRO_REJECT_INSUFFICIENT: "有效窗口不足",
+    GYRO_REJECT_SOLVER: "矩阵求解失败",
+    GYRO_REJECT_RMS: "重力一致性 RMS 超限",
+    GYRO_REJECT_CROSS_AXIS: "交叉轴耦合超限",
+}
 
 
 @dataclass(frozen=True)
@@ -57,6 +70,8 @@ class RawImuFrame:
     seq: int
     version: int
     presence_mask: int
+    stage_id: int
+    capture_mask: int
     samples: tuple[ImuSample, ...]
 
 
@@ -77,6 +92,8 @@ class RegisterRawImuFrame:
     presence_mask: int
     imu_model: int
     flags: int
+    stage_id: int
+    capture_mask: int
     samples: tuple[RegisterImuSample, ...]
 
 
@@ -130,19 +147,48 @@ class VersionFrame:
     def accel_intrinsic(self) -> bool:
         return bool(self.features & 0x40)
 
+    @property
+    def factory_raw_streams(self) -> bool:
+        return bool(self.features & 0x80)
+
+    @property
+    def r024_compatible(self) -> bool:
+        return (
+            self.payload_version == EXPECTED_VERSION_PAYLOAD_VERSION
+            and self.revision == EXPECTED_FIRMWARE_REVISION
+            and self.revision_tag == EXPECTED_FIRMWARE_TAG
+            and self.factory_intrinsic
+            and self.accel_intrinsic
+            and self.factory_raw_streams
+        )
+
 
 @dataclass(frozen=True)
 class GyroQuality:
     ok: bool
+    reject_flags: int
     rms_mdeg: int
     window_count: int
     max_off_axis: int
+
+    @property
+    def reject_reasons(self) -> tuple[str, ...]:
+        return tuple(
+            label
+            for mask, label in GYRO_REJECT_LABELS.items()
+            if self.reject_flags & mask
+        )
 
 
 @dataclass(frozen=True)
 class AccelQuality:
     ok: bool
-    raw: bytes
+    residual_x1000: int
+    max_abs_scale_error_x1000: int
+    max_cross_axis_x1000: int
+    bias_x_mg: int
+    bias_y_mg: int
+    bias_z_mg: int
 
 
 @dataclass(frozen=True)
@@ -181,7 +227,12 @@ class McalReportFrame:
             and bool(self.flags & 0x01)
             and len(self.gyro_quality) == 11
             and len(self.gyro_matrices) == 11
-            and all(item.ok and item.window_count >= EXPECTED_GYRO_SEGMENTS for item in self.gyro_quality)
+            and all(
+                item.ok
+                and item.reject_flags == 0
+                and item.window_count >= EXPECTED_GYRO_SEGMENTS
+                for item in self.gyro_quality
+            )
         )
 
     @property
@@ -269,7 +320,7 @@ class ProtocolParser:
             frame_type = self.buffer[2]
             seq = self.buffer[3]
             payload_length = struct.unpack_from("<I", self.buffer, 4)[0]
-            if payload_length < 4 or payload_length > MAX_PAYLOAD_LENGTH:
+            if payload_length > MAX_PAYLOAD_LENGTH:
                 self.stats.invalid_lengths += 1
                 self.stats.invalid_frames += 1
                 del self.buffer[:2]
@@ -330,7 +381,14 @@ class ProtocolParser:
             if not _finite(values):
                 raise ValueError("non-finite type=9 sample")
             samples.append(ImuSample(*values))
-        return RawImuFrame(seq, payload[0], presence_mask, tuple(samples))
+        return RawImuFrame(
+            seq,
+            payload[0],
+            presence_mask,
+            payload[4],
+            payload[5],
+            tuple(samples),
+        )
 
     def _parse_register_raw_imu(self, seq: int, payload: bytes) -> RegisterRawImuFrame:
         if len(payload) < 8 or payload[0] != 1 or payload[1] != 11 or len(payload) != 8 + 11 * 12:
@@ -339,7 +397,16 @@ class ProtocolParser:
         samples = tuple(
             RegisterImuSample(*struct.unpack_from("<6h", payload, 8 + index * 12)) for index in range(11)
         )
-        return RegisterRawImuFrame(seq, payload[0], presence_mask, payload[4], payload[5], samples)
+        return RegisterRawImuFrame(
+            seq,
+            payload[0],
+            presence_mask,
+            payload[4],
+            payload[5],
+            payload[6],
+            payload[7],
+            samples,
+        )
 
     def _parse_raw_mag(self, seq: int, payload: bytes) -> RawMagFrame:
         if len(payload) != 16 or payload[0] != 1:
@@ -407,6 +474,7 @@ class ProtocolParser:
                 gyro_quality.append(
                     GyroQuality(
                         bool(payload[offset]),
+                        payload[offset + 1],
                         struct.unpack_from("<H", payload, offset + 2)[0],
                         struct.unpack_from("<H", payload, offset + 4)[0],
                         struct.unpack_from("<H", payload, offset + 6)[0],
@@ -416,8 +484,18 @@ class ProtocolParser:
         accel_quality_offset = 12 + 11 * 8 + 11 * 36
         if payload[7] & 0x02 and len(payload) >= accel_quality_offset + imu_count * 14:
             for index in range(imu_count):
-                raw = payload[accel_quality_offset + index * 14 : accel_quality_offset + (index + 1) * 14]
-                accel_quality.append(AccelQuality(bool(raw[0]), raw))
+                offset = accel_quality_offset + index * 14
+                accel_quality.append(
+                    AccelQuality(
+                        bool(payload[offset]),
+                        struct.unpack_from("<H", payload, offset + 2)[0],
+                        struct.unpack_from("<H", payload, offset + 4)[0],
+                        struct.unpack_from("<H", payload, offset + 6)[0],
+                        struct.unpack_from("<h", payload, offset + 8)[0],
+                        struct.unpack_from("<h", payload, offset + 10)[0],
+                        struct.unpack_from("<h", payload, offset + 12)[0],
+                    )
+                )
         return McalReportFrame(
             seq=seq,
             context=payload[0],
