@@ -2,6 +2,7 @@ import os
 import time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from imu_calibration.quickcal_station.workflow import YawLimits
 from imu_calibration.quickcal_station.action_config import DEFAULT_ACTIONS
@@ -14,8 +15,12 @@ try:
     from imu_calibration.quickcal_station.window import (
         MAG_AUTO_STEPS,
         MAG_M01_BLEND_PERCENT,
-        MAG_M01_COMBINED_WAYPOINTS,
+        MAG_M01_J6_SAFE_DEG,
+        MAG_M01_POSE_WAYPOINTS,
         MAG_M01_SEGMENT_S,
+        MAG_M01_XYZ_TOLERANCE_MM,
+        MAG_M04_MOTION_GRACE_S,
+        MAG_M04_STOP_SETTLE_S,
         MAG_TRAJECTORIES,
         QuickCalWindow,
     )
@@ -23,8 +28,10 @@ except ModuleNotFoundError as exc:
     if exc.name != "PySide6":
         raise
     QuickCalCoordinator = QuickCalWindow = RobotState = RunState = None
-    MAG_AUTO_STEPS = MAG_M01_BLEND_PERCENT = MAG_M01_COMBINED_WAYPOINTS = MAG_TRAJECTORIES = None
-    MAG_M01_SEGMENT_S = None
+    MAG_AUTO_STEPS = MAG_M01_BLEND_PERCENT = MAG_M01_J6_SAFE_DEG = None
+    MAG_M01_POSE_WAYPOINTS = MAG_TRAJECTORIES = None
+    MAG_M01_SEGMENT_S = MAG_M01_XYZ_TOLERANCE_MM = None
+    MAG_M04_MOTION_GRACE_S = MAG_M04_STOP_SETTLE_S = None
 
 
 class ManualMotionHarness:
@@ -105,6 +112,119 @@ class MagneticMotionHarness:
             _tool_axes=QuickCalCoordinator._tool_axes,
         )
         self._mag_reference_pose = (0.0,) * 6
+        self._mag_reference_joints = (0.0,) * 6
+
+
+class FakeM01Robot:
+    def __init__(self):
+        self.moves = []
+        self.speed_factors = []
+
+    def set_speed_factor(self, percent):
+        self.speed_factors.append(percent)
+        return True
+
+    def move_pose_l(
+        self,
+        target,
+        velocity,
+        *,
+        user,
+        tool,
+        acceleration_percent,
+        blend_percent,
+    ):
+        self.moves.append(
+            (
+                target,
+                velocity,
+                user,
+                tool,
+                acceleration_percent,
+                blend_percent,
+            )
+        )
+        return True
+
+
+class M01TrajectoryHarness:
+    if QuickCalWindow is not None:
+        _matmul3 = staticmethod(QuickCalWindow._matmul3)
+        _m01_absolute_targets = QuickCalWindow._m01_absolute_targets
+        _m01_fixed_frame_angles = QuickCalWindow._m01_fixed_frame_angles
+        _orientation_error_deg = QuickCalWindow._orientation_error_deg
+        _start_m01_combined_trajectory = QuickCalWindow._start_m01_combined_trajectory
+
+    def __init__(self):
+        self.reference_joints = (-6.0, -8.0, -114.0, -58.0, -96.0, 40.0)
+        self._mag_reference_pose = (0.0,) * 6
+        self._mag_reference_joints = self.reference_joints
+        self._mag_speed_factor = 0
+        self._mag_speed_source = ""
+        self._auto_action_seen_motion = False
+        self.fail_message = ""
+        self.logs = []
+        self.robot = FakeM01Robot()
+        self.coordinator = SimpleNamespace(
+            _tool_axes=QuickCalCoordinator._tool_axes,
+            recorder=SimpleNamespace(marker=lambda *_args: None),
+        )
+
+    def _fail_mag_auto_action(self, message):
+        self.fail_message = message
+
+    def _append_log(self, message, level="info"):
+        self.logs.append((message, level))
+
+
+class M04MotionHarness:
+    if QuickCalWindow is not None:
+        _update_mag_auto_action = QuickCalWindow._update_mag_auto_action
+
+    def __init__(self, phase="static_wait_stop"):
+        self._auto_action_step = "M04"
+        self._auto_action_stable_since_ns = 0
+        self._mag_phase = phase
+        self._mag_phase_started_ns = 10_000_000_000
+        self._mag_m04_motion_since_ns = 0
+        self._mag_reference_pose = (0.0,) * 6
+        self.logs = []
+        self.fail_message = ""
+        self.confirm_calls = 0
+        self.coordinator = SimpleNamespace(
+            current_step=SimpleNamespace(exit_s=5.0),
+            condition_stable_since_ns=0,
+            confirm_current_action=self._confirm,
+        )
+
+    def _check_auto_action_timeout(self, _now):
+        pass
+
+    def _mag_limit_error(self, _step_id, _state):
+        return ""
+
+    def _fail_mag_auto_action(self, message):
+        self.fail_message = message
+
+    def _append_log(self, message, level="info"):
+        self.logs.append((message, level))
+
+    def _confirm(self):
+        self.confirm_calls += 1
+        return True
+
+    def update_at(self, seconds, *, mode=5, linear=0.0, angular=0.0):
+        state = SimpleNamespace(
+            mode=mode,
+            linear_speed_norm=linear,
+            angular_speed_norm=angular,
+            pose=(0.0,) * 6,
+        )
+        with patch(
+            "imu_calibration.quickcal_station.window.time.monotonic_ns",
+            return_value=int(seconds * 1_000_000_000),
+        ):
+            self._update_mag_auto_action(state)
 
 
 class FullAutoHarness:
@@ -295,39 +415,25 @@ class GyroMotionParameterTests(unittest.TestCase):
         )
         self.assertEqual(MAG_TRAJECTORIES["M01"], ())
         self.assertAlmostEqual(
-            (len(MAG_M01_COMBINED_WAYPOINTS) - 1) * MAG_M01_SEGMENT_S,
+            (len(MAG_M01_POSE_WAYPOINTS) - 1) * MAG_M01_SEGMENT_S,
             40.0,
         )
-        self.assertEqual(MAG_M01_COMBINED_WAYPOINTS[0], (0.0, 0.0))
-        self.assertEqual(MAG_M01_COMBINED_WAYPOINTS[-1], (0.0, 0.0))
+        self.assertEqual(MAG_M01_POSE_WAYPOINTS[0], (0.0, 0.0))
+        self.assertEqual(MAG_M01_POSE_WAYPOINTS[-1], (0.0, 0.0))
         self.assertAlmostEqual(
-            max(point[0] for point in MAG_M01_COMBINED_WAYPOINTS), 75.0
-        )
-        self.assertAlmostEqual(
-            min(point[0] for point in MAG_M01_COMBINED_WAYPOINTS), -75.0
+            max(point[0] for point in MAG_M01_POSE_WAYPOINTS), 75.0
         )
         self.assertAlmostEqual(
-            max(point[1] for point in MAG_M01_COMBINED_WAYPOINTS), 75.0
+            min(point[0] for point in MAG_M01_POSE_WAYPOINTS), -75.0
         )
         self.assertAlmostEqual(
-            min(point[1] for point in MAG_M01_COMBINED_WAYPOINTS), -75.0
+            max(point[1] for point in MAG_M01_POSE_WAYPOINTS), 75.0
         )
-        harness = SimpleNamespace(
-            coordinator=SimpleNamespace(_tool_axes=QuickCalCoordinator._tool_axes),
-            _matmul3=QuickCalWindow._matmul3,
+        self.assertAlmostEqual(
+            min(point[1] for point in MAG_M01_POSE_WAYPOINTS), -75.0
         )
-        targets = QuickCalWindow._m01_absolute_targets(
-            harness, (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-        )
-        self.assertEqual(len(targets), 8)
+        harness = M01TrajectoryHarness()
         self.assertEqual(MAG_M01_BLEND_PERCENT, 100)
-        # With an identity entry pose the absolute controller targets are the
-        # intended fixed-frame Rz/Ry Roll/Pitch waypoints.
-        self.assertTrue(all(target[:3] == (0.0, 0.0, 0.0) for target in targets))
-        self.assertAlmostEqual(targets[1][5], 75.0)
-        self.assertAlmostEqual(targets[-1][3], 0.0)
-        self.assertAlmostEqual(targets[-1][4], 0.0)
-        self.assertAlmostEqual(targets[-1][5], 0.0)
         self.assertEqual(
             MAG_TRAJECTORIES["M02"],
             (("Rx", True, 5.0), ("Rx", False, 5.0)),
@@ -338,37 +444,147 @@ class GyroMotionParameterTests(unittest.TestCase):
         )
         self.assertEqual(MAG_TRAJECTORIES["M04"], ())
 
+    def test_m01_queues_fixed_xyz_composite_ry_j6_direction_poses(self):
+        harness = M01TrajectoryHarness()
+        state = SimpleNamespace(user=0, tool=1)
+
+        self.assertTrue(harness._start_m01_combined_trajectory(state))
+
+        self.assertEqual(harness.fail_message, "")
+        self.assertEqual(harness.robot.speed_factors, [100])
+        self.assertEqual(len(harness.robot.moves), 8)
+        self.assertEqual(
+            [move[5] for move in harness.robot.moves],
+            [MAG_M01_BLEND_PERCENT] * 7 + [0],
+        )
+        self.assertTrue(
+            all(move[0][:3] == harness._mag_reference_pose[:3] for move in harness.robot.moves)
+        )
+        self.assertTrue(all(move[2:4] == (0, 1) for move in harness.robot.moves))
+        for move, (expected_pitch, expected_roll) in zip(
+            harness.robot.moves, MAG_M01_POSE_WAYPOINTS[1:]
+        ):
+            actual_roll, actual_pitch = harness._m01_fixed_frame_angles(
+                harness._mag_reference_pose, move[0]
+            )
+            self.assertAlmostEqual(actual_pitch, expected_pitch)
+            self.assertAlmostEqual(actual_roll, expected_roll)
+        self.assertEqual(harness.robot.moves[-1][0], harness._mag_reference_pose)
+
+    def test_m01_real_failure_entry_pose_keeps_xyz_and_composes_roll_before_ik(self):
+        harness = M01TrajectoryHarness()
+        harness._mag_reference_pose = (
+            505.841522,
+            -170.047394,
+            343.942047,
+            -10.870000,
+            -89.923600,
+            -169.125000,
+        )
+
+        targets = harness._m01_absolute_targets(harness._mag_reference_pose)
+
+        self.assertEqual(len(targets), 8)
+        self.assertTrue(
+            all(target[:3] == harness._mag_reference_pose[:3] for target in targets)
+        )
+        first_roll, first_pitch = harness._m01_fixed_frame_angles(
+            harness._mag_reference_pose, targets[0]
+        )
+        self.assertAlmostEqual(first_pitch, MAG_M01_POSE_WAYPOINTS[1][0])
+        self.assertAlmostEqual(first_roll, MAG_M01_POSE_WAYPOINTS[1][1])
+
+    def test_m04_requires_one_continuous_second_before_hold(self):
+        harness = M04MotionHarness()
+
+        harness.update_at(10.0)
+        harness.update_at(10.9)
+        self.assertEqual(harness._mag_phase, "static_wait_stop")
+
+        harness.update_at(10.0 + MAG_M04_STOP_SETTLE_S)
+
+        self.assertEqual(harness._mag_phase, "static_settle")
+        self.assertIn("连续停稳 1.0 秒", harness.logs[-1][0])
+
+    def test_m04_single_speed_spike_restarts_the_full_hold(self):
+        harness = M04MotionHarness("static_settle")
+
+        harness.update_at(12.0, linear=6.3, angular=0.93)
+
+        self.assertEqual(harness._mag_phase, "static_recover")
+        self.assertEqual(harness.fail_message, "")
+        self.assertIn("线速度=6.30 mm/s", harness.logs[-1][0])
+
+        harness.update_at(12.02)
+        harness.update_at(12.02 + MAG_M04_STOP_SETTLE_S)
+
+        self.assertEqual(harness._mag_phase, "static_settle")
+        restarted_at = harness._mag_phase_started_ns
+        harness.update_at(17.01)
+        self.assertEqual(harness.confirm_calls, 0)
+        harness.update_at(restarted_at / 1_000_000_000.0 + 5.0)
+        self.assertEqual(harness.confirm_calls, 1)
+
+    def test_m04_sustained_motion_still_fails(self):
+        harness = M04MotionHarness("static_settle")
+
+        harness.update_at(12.0, linear=3.0)
+        harness.update_at(12.0 + MAG_M04_MOTION_GRACE_S, linear=3.0)
+
+        self.assertIn("持续机械臂运动", harness.fail_message)
+        self.assertIn("线速度=3.00 mm/s", harness.fail_message)
+
+    def test_m04_alarm_mode_fails_immediately(self):
+        harness = M04MotionHarness("static_settle")
+
+        harness.update_at(12.0, mode=9)
+
+        self.assertIn("异常模式：mode=9", harness.fail_message)
+
     def test_magnetic_limits_follow_each_work_order_axis(self):
         harness = MagneticMotionHarness()
+        m01_state = lambda pose, j6=0.0: SimpleNamespace(
+            pose=pose,
+            joints=(0.0, 0.0, 0.0, 0.0, 0.0, j6),
+        )
 
         self.assertEqual(
             harness._mag_limit_error(
-                "M01", SimpleNamespace(pose=(0.0, 0.0, 0.0, 0.0, 0.0, 75.0))
+                "M01", m01_state((0.0, 0.0, 0.0, 0.0, 0.0, 75.0), 75.0)
             ),
             "",
         )
         self.assertIn(
-            "Tool Rz",
+            "J6 往复",
             harness._mag_limit_error(
-                "M01", SimpleNamespace(pose=(0.0, 0.0, 0.0, 0.0, 0.0, 81.0))
+                "M01", m01_state((0.0, 0.0, 0.0, 0.0, 0.0, 81.0), 81.0)
             ),
         )
         self.assertEqual(
             harness._mag_limit_error(
-                "M01", SimpleNamespace(pose=(0.0, 0.0, 0.0, 0.0, 75.0, 0.0))
+                "M01", m01_state((0.0, 0.0, 0.0, 0.0, 75.0, 0.0))
             ),
             "",
         )
         self.assertIn(
             "Tool Ry",
             harness._mag_limit_error(
-                "M01", SimpleNamespace(pose=(0.0, 0.0, 0.0, 0.0, 81.0, 0.0))
+                "M01", m01_state((0.0, 0.0, 0.0, 0.0, 81.0, 0.0))
             ),
         )
-        # M01 combines fixture-mapped Tool Rz (Roll) and Tool Ry (Pitch).
+        self.assertIn(
+            "TCP XYZ",
+            harness._mag_limit_error(
+                "M01",
+                m01_state(
+                    (MAG_M01_XYZ_TOLERANCE_MM + 0.1, 0.0, 0.0, 0.0, 0.0, 0.0)
+                ),
+            ),
+        )
+        # M01 combines fixed-XYZ Tool Ry pitch and the J6-direction roll.
         self.assertEqual(
             harness._mag_limit_error(
-                "M01", SimpleNamespace(pose=(0.0, 0.0, 0.0, 0.0, 75.0, 31.82))
+                "M01", m01_state((0.0, 0.0, 0.0, 0.0, 75.0, 53.03), 53.03)
             ),
             "",
         )

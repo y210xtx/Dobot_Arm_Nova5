@@ -604,7 +604,8 @@ class CoordinatorCompatibilityTests(unittest.TestCase):
             coordinator.motion_coverage[key] = True
         self.assertEqual(coordinator._motion_coverage_error("M01"), "")
         coordinator.motion_coverage["y_negative"] = False
-        self.assertIn("Tool Rz/Ry", coordinator._motion_coverage_error("M01"))
+        self.assertIn("J6", coordinator._motion_coverage_error("M01"))
+        self.assertIn("Tool Ry", coordinator._motion_coverage_error("M01"))
 
         coordinator._reset_motion_coverage()
         coordinator.motion_coverage["x_positive"] = True

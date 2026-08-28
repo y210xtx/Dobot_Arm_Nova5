@@ -718,7 +718,10 @@ class QuickCalCoordinator(QObject):
             required = ("z_positive", "z_negative", "y_positive", "y_negative")
             missing = [name for name in required if not self.motion_coverage[name]]
             if missing:
-                return "M01 Roll/Pitch 覆盖不足：Tool Rz/Ry 必须均包含正、反向运动"
+                return (
+                    "M01 J6/Pitch 覆盖不足：J6 叠加产生的 Tool Rz 与基础 "
+                    "Tool Ry 必须均包含正、反向运动"
+                )
             return ""
         if not (
             self.motion_coverage["x_positive"]
@@ -762,7 +765,7 @@ class QuickCalCoordinator(QObject):
                 abs(tool_speed[index]) >= self.MAG_COVERAGE_SPEED_DEG_S
                 for index in (1, 2)
             ):
-                return "M01 要求机械臂保持 Tool Rz/Ry 连续慢速翻转"
+                return "M01 要求机械臂保持固定 XYZ 的 Tool Ry 与 J6 方向连续慢速往复"
         elif step_id in ("M02", "M03"):
             if abs(tool_speed[0]) < self.MAG_COVERAGE_SPEED_DEG_S:
                 return f"{step_id} 要求机械臂保持 Tool Rx 慢速往返"
