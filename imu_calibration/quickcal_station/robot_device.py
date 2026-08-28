@@ -268,6 +268,8 @@ class RobotDevice(QObject):
         velocity_percent: int = 20,
         user: int = -1,
         tool: int = -1,
+        acceleration_percent: int = 20,
+        blend_percent: int = 0,
     ) -> bool:
         values = tuple(float(value) for value in pose)
         if len(values) != 6 or not all(math.isfinite(value) for value in values):
@@ -277,6 +279,8 @@ class RobotDevice(QObject):
             self.error_occurred.emit("绝对运动的 User/Tool 编号必须在 0～9 范围内")
             return False
         velocity_percent = max(1, min(100, int(velocity_percent)))
+        acceleration_percent = max(1, min(100, int(acceleration_percent)))
+        blend_percent = max(0, min(100, int(blend_percent)))
         return self._command(
             "机械臂直线移动到绝对 TCP 位姿",
             lambda: self.dashboard.MovL(
@@ -284,9 +288,9 @@ class RobotDevice(QObject):
                 0,
                 user=int(user),
                 tool=int(tool),
-                a=20,
+                a=acceleration_percent,
                 v=velocity_percent,
-                cp=0,
+                cp=blend_percent,
             ),
         )
 
@@ -348,7 +352,11 @@ class RobotDevice(QObject):
         return True
 
     def relative_tool_move(
-        self, offset: tuple[float, ...], velocity_percent: int = 20
+        self,
+        offset: tuple[float, ...],
+        velocity_percent: int = 20,
+        acceleration_percent: int = 20,
+        blend_percent: int = 0,
     ) -> bool:
         values = tuple(float(value) for value in offset)
         if len(values) != 6 or not all(math.isfinite(value) for value in values):
@@ -364,10 +372,17 @@ class RobotDevice(QObject):
             self.error_occurred.emit("单次 Tool Rx/Ry/Rz 相对角度必须在 -180°～180°之间")
             return False
         velocity_percent = max(1, min(100, int(velocity_percent)))
+        acceleration_percent = max(1, min(100, int(acceleration_percent)))
+        blend_percent = max(0, min(100, int(blend_percent)))
         return self._command(
             "Tool 坐标系末端相对运动",
             lambda: self.dashboard.RelMovLTool(
-                *values, user=-1, tool=-1, a=20, v=velocity_percent, cp=0
+                *values,
+                user=-1,
+                tool=-1,
+                a=acceleration_percent,
+                v=velocity_percent,
+                cp=blend_percent,
             ),
         )
 

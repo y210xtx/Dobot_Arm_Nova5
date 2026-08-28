@@ -115,22 +115,43 @@ GYRO_SMOOTH_STOP_MARGIN_DEG = 0.35
 
 MAG_AUTO_STEPS = ("M01", "M02", "M03", "M04")
 MAG_RATE_TOLERANCE_DEG_S = 4.0
-MAG_TIMEOUT_S = 60.0
+MAG_TIMEOUT_S = 90.0
 MAG_NEUTRAL_TOLERANCE_DEG = 2.0
-MAG_YAW_SAFE_DEG = 75.0
-MAG_TARGET_RATE_DEG_S = {"M01": 12.0, "M02": 10.0, "M03": 10.0}
-# The path shapes come from the robot work order; only their durations are
-# Legacy magnetic-motion helpers retained for old local configurations; r024
-# never places an M stage in the executable workflow.
+MAG_M01_ROLL_SAFE_DEG = 75.0
+MAG_M01_PITCH_SAFE_DEG = 75.0
+MAG_M01_SEGMENT_S = 5.0
+MAG_M01_GLOBAL_SPEED_FACTOR = 100
+# Queue all intermediate figure-eight points with full controller blending.
+# RelMovLTool already receives the complete path at stage start; CP=100 avoids
+# a deliberate deceleration at every five-second Rz/Ry hand-off. The final
+# point remains CP=0 so the robot settles at the taught neutral pose.
+MAG_M01_BLEND_PERCENT = 100
+MAG_YAW_SAFE_DEG = 45.0
+MAG_TARGET_RATE_DEG_S = {"M02": 9.0, "M03": 9.0}
+# M01 is a sampled Lissajous/figure-eight in Tool Rz/Ry. Tool Rz maps to IMU
+# Roll and Tool Ry maps to IMU Pitch for this fixture. Consecutive
+# points always change both axes, so the controller performs a true combined
+# 3-D path instead of alternating single-axis MoveJog commands.  Eight five-
+# second absolute-orientation segments start/end at neutral and cover the
+# initial-Tool-frame Roll/Rz ±75°, Pitch/Ry ±75° path.
+_MAG_M01_DIAGONAL_ROLL_DEG = MAG_M01_ROLL_SAFE_DEG / math.sqrt(2.0)
+MAG_M01_COMBINED_WAYPOINTS = (
+    (0.0, 0.0),
+    (+_MAG_M01_DIAGONAL_ROLL_DEG, +MAG_M01_PITCH_SAFE_DEG),
+    (+MAG_M01_ROLL_SAFE_DEG, 0.0),
+    (+_MAG_M01_DIAGONAL_ROLL_DEG, -MAG_M01_PITCH_SAFE_DEG),
+    (0.0, 0.0),
+    (-_MAG_M01_DIAGONAL_ROLL_DEG, +MAG_M01_PITCH_SAFE_DEG),
+    (-MAG_M01_ROLL_SAFE_DEG, 0.0),
+    (-_MAG_M01_DIAGONAL_ROLL_DEG, -MAG_M01_PITCH_SAFE_DEG),
+    (0.0, 0.0),
+)
+# M02/M03 use the fixture's Tool Rx axis for one-sided Yaw jog paths from
+# neutral to the safe endpoint and back to neutral.
 MAG_TRAJECTORIES = {
-    "M01": (
-        ("Rx", True, 2.5),
-        ("Ry", True, 2.5),
-        ("Rx", False, 5.0),
-        ("Ry", False, 5.0),
-    ),
-    "M02": (("Rz", True, 7.5), ("Rz", False, 7.5)),
-    "M03": (("Rz", False, 7.5), ("Rz", True, 7.5)),
+    "M01": (),
+    "M02": (("Rx", True, 5.0), ("Rx", False, 5.0)),
+    "M03": (("Rx", False, 5.0), ("Rx", True, 5.0)),
     "M04": (),
 }
 MAG_STEP_BUTTON_TEXT = {
@@ -245,8 +266,8 @@ class QuickCalWindow(QMainWindow):
         self._full_auto_timer = QTimer(self)
         self._full_auto_timer.setInterval(250)
         self._full_auto_timer.timeout.connect(self._try_start_full_auto_step)
-        self._full_auto_safe_return_started_ns = 0
-        self._full_auto_safe_return_seen_motion = False
+        self._full_auto_neutral_return_started_ns = 0
+        self._full_auto_neutral_return_seen_motion = False
         self._gyro_x_phase = ""
         self._gyro_x_phase_started_ns = 0
         self._gyro_x_reference_pose: tuple[float, ...] | None = None
@@ -257,6 +278,7 @@ class QuickCalWindow(QMainWindow):
         self._mag_phase = ""
         self._mag_phase_started_ns = 0
         self._mag_segment_index = -1
+        self._mag_pending_segment_index = -1
         self._mag_reference_pose: tuple[float, ...] | None = None
         self._mag_original_speed_factor = 0
         self._mag_speed_factor = 0
@@ -532,6 +554,37 @@ class QuickCalWindow(QMainWindow):
                 self.report_table.setItem(row, column, QTableWidgetItem("--"))
         layout.addWidget(self.report_summary)
         layout.addWidget(self.report_table)
+
+        mag_group = QGroupBox("磁标定质量（MMC5983MA）")
+        mag_layout = QVBoxLayout(mag_group)
+        self.mag_report_summary = QLabel("尚未收到 type=7 磁质量结果")
+        self.mag_report_summary.setWordWrap(True)
+        self.mag_report_table = QTableWidget(0, 10)
+        self.mag_report_table.setHorizontalHeaderLabels(
+            (
+                "磁传感器",
+                "样本数",
+                "Span X",
+                "Span Y",
+                "Span Z",
+                "Offset X",
+                "Offset Y",
+                "Offset Z",
+                "Scale X/Y/Z",
+                "质量",
+            )
+        )
+        self.mag_report_table.verticalHeader().setVisible(False)
+        self.mag_report_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        mag_header = self.mag_report_table.horizontalHeader()
+        mag_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        mag_header.setMinimumSectionSize(65)
+        for column, width in enumerate((105, 85, 80, 80, 80, 90, 90, 90, 180, 280)):
+            self.mag_report_table.setColumnWidth(column, width)
+        self.mag_report_table.setMaximumHeight(145)
+        mag_layout.addWidget(self.mag_report_summary)
+        mag_layout.addWidget(self.mag_report_table)
+        layout.addWidget(mag_group)
         return page
 
     def _build_actions_page(self) -> QWidget:
@@ -1467,7 +1520,7 @@ class QuickCalWindow(QMainWindow):
         if step_id in MAG_AUTO_STEPS:
             self._start_mag_auto_action(step_id)
             return
-        if step_id == "S02" and not self._update_full_auto_safe_return():
+        if step_id == "S02" and not self._update_full_auto_neutral_return():
             return
         if step_id in ("S01", "S02"):
             # Wait here rather than emitting repeated condition errors while the
@@ -1478,10 +1531,10 @@ class QuickCalWindow(QMainWindow):
                 return
             self.coordinator.confirm_current_action()
 
-    def _update_full_auto_safe_return(self) -> bool:
-        taught = self.taught_poses.get("safe")
+    def _update_full_auto_neutral_return(self) -> bool:
+        taught = self.taught_poses.get("neutral")
         if taught is None:
-            self._show_error("全自动收尾失败：尚未示教安全位", True)
+            self._show_error("全自动收尾失败：尚未示教标定中位", True)
             return False
         state = self.robot.latest_state
         now = time.monotonic_ns()
@@ -1490,7 +1543,7 @@ class QuickCalWindow(QMainWindow):
             or state is None
             or now - state.received_monotonic_ns >= 1_000_000_000
         ):
-            self._show_error("全自动回安全位失败：机械臂未连接或反馈超时", True)
+            self._show_error("全自动回标定中位失败：机械臂未连接或反馈超时", True)
             return False
         if (
             self._at_taught_pose(taught)
@@ -1498,10 +1551,10 @@ class QuickCalWindow(QMainWindow):
             and state.linear_speed_norm <= 1.0
             and state.angular_speed_norm <= 0.8
         ):
-            self._full_auto_safe_return_started_ns = 0
-            self._full_auto_safe_return_seen_motion = False
+            self._full_auto_neutral_return_started_ns = 0
+            self._full_auto_neutral_return_seen_motion = False
             return True
-        if self._full_auto_safe_return_started_ns == 0:
+        if self._full_auto_neutral_return_started_ns == 0:
             if (
                 state.mode != 5
                 or state.linear_speed_norm > 1.0
@@ -1509,34 +1562,40 @@ class QuickCalWindow(QMainWindow):
             ):
                 return False
             if not self.robot.activate_frames(taught.user, taught.tool):
-                self._show_error("全自动回安全位失败：User/Tool 启用失败", True)
+                self._show_error("全自动回标定中位失败：User/Tool 启用失败", True)
                 return False
             command_ok = (
-                self.robot.move_joints(taught.joints, 15)
+                self.robot.move_joints(taught.joints, NEUTRAL_RETURN_SPEED_PERCENT)
                 if taught.joints
                 else self.robot.move_pose_j(
-                    taught.pose, 15, taught.user, taught.tool
+                    taught.pose,
+                    NEUTRAL_RETURN_SPEED_PERCENT,
+                    taught.user,
+                    taught.tool,
                 )
             )
             if not command_ok:
-                self._show_error("全自动回安全位命令发送失败", True)
+                self._show_error("全自动回标定中位命令发送失败", True)
                 return False
-            self._full_auto_safe_return_started_ns = now
-            self._full_auto_safe_return_seen_motion = False
-            self._append_log("S02 开始以 15% 速度自动返回示教安全位", "info")
+            self._full_auto_neutral_return_started_ns = now
+            self._full_auto_neutral_return_seen_motion = False
+            self._append_log(
+                f"S02 开始以 {NEUTRAL_RETURN_SPEED_PERCENT}% 速度自动返回示教标定中位",
+                "info",
+            )
             return False
-        elapsed_ns = now - self._full_auto_safe_return_started_ns
+        elapsed_ns = now - self._full_auto_neutral_return_started_ns
         if elapsed_ns > 90_000_000_000:
-            self._show_error("全自动回安全位等待到位超时", True)
+            self._show_error("全自动回标定中位等待到位超时", True)
             return False
         if state.mode in (7, 8) or state.linear_speed_norm > 1.0 or state.angular_speed_norm > 0.8:
-            self._full_auto_safe_return_seen_motion = True
+            self._full_auto_neutral_return_seen_motion = True
             return False
         if state.mode != 5:
             return False
-        if not self._full_auto_safe_return_seen_motion and elapsed_ns < 3_000_000_000:
+        if not self._full_auto_neutral_return_seen_motion and elapsed_ns < 3_000_000_000:
             return False
-        self._show_error("机械臂已停止，但没有到达示教安全位", True)
+        self._show_error("机械臂已停止，但没有到达示教标定中位", True)
         return False
 
     def _start_accel_auto_action(
@@ -2409,9 +2468,6 @@ class QuickCalWindow(QMainWindow):
         if not self.coordinator.environment_confirmed:
             self._show_error("磁翻转前必须确认磁环境、夹具和线束状态", True)
             return
-        if step_id == "M01" and not self.coordinator.limits.valid:
-            self._show_error("Tool Rx 实测限位未通过，禁止执行 M01 Roll/Pitch 翻转", True)
-            return
         state = self.robot.latest_state
         if (
             not self.robot.connected
@@ -2438,31 +2494,47 @@ class QuickCalWindow(QMainWindow):
             )
             return
         trajectory = MAG_TRAJECTORIES[step_id]
-        planned_s = sum(duration_s for _axis, _positive, duration_s in trajectory)
+        if step_id == "M01":
+            planned_s = (
+                len(MAG_M01_COMBINED_WAYPOINTS) - 1
+            ) * MAG_M01_SEGMENT_S
+        else:
+            planned_s = sum(
+                duration_s for _axis, _positive, duration_s in trajectory
+            )
         if step_id == "M04":
-            planned_s = self.coordinator.current_step.capture_s
-        if abs(planned_s - self.coordinator.current_step.capture_s) > 0.01:
+            planned_s = self.coordinator.current_step.exit_s
+        expected_s = (
+            self.coordinator.current_step.exit_s
+            if step_id == "M04"
+            else self.coordinator.current_step.capture_s
+        )
+        if abs(planned_s - expected_s) > 0.01:
             self._show_error(
-                f"{step_id} 自动轨迹 {planned_s:.1f} s 与阶段采集时间 "
-                f"{self.coordinator.current_step.capture_s:.1f} s 不一致",
+                f"{step_id} 自动轨迹 {planned_s:.1f} s 与工单时间 "
+                f"{expected_s:.1f} s 不一致",
                 True,
             )
             return
-        path_text = (
-            " → ".join(
+        if step_id == "M01":
+            path_text = (
+                "Rz/Ry 8 字组合轨迹（8×5.0s，"
+                "Rz ±75°、Ry ±75°）"
+            )
+        elif trajectory:
+            path_text = " → ".join(
                 f"{axis}{'+' if positive else '-'}({duration_s:.1f}s)"
                 for axis, positive, duration_s in trajectory
             )
-            if trajectory
-            else "Tool Rz=0°，标定中位静止保持"
-        )
+        else:
+            path_text = "Tool Rz=0°，标定中位静止保持"
         limits = self.coordinator.limits
         if step_id == "M01":
             action_detail = (
-                f"Yaw 保持中位，仅执行 Roll/Pitch：{path_text}\n"
-                f"目标速度 {MAG_TARGET_RATE_DEG_S[step_id]:.1f}°/s；"
-                f"受限 Tool Rx 强制保持在安全位 "
-                f"{limits.negative_safe_deg:+.1f}°～{limits.positive_safe_deg:+.1f}°。"
+                f"Tool Rz（Roll）与 Tool Ry（Pitch）同时叠加：{path_text}\n"
+                f"以进入 M01 时的 Tool 姿态建立固定参考系，并使用 MovL 绝对姿态插补，CP={MAG_M01_BLEND_PERCENT}；"
+                f"Roll 限制为 ±{MAG_M01_ROLL_SAFE_DEG:.0f}°，"
+                f"Pitch 限制为 ±{MAG_M01_PITCH_SAFE_DEG:.0f}°。"
             )
         elif step_id == "M02":
             action_detail = (
@@ -2477,9 +2549,12 @@ class QuickCalWindow(QMainWindow):
                 f"路径约 0° → -{MAG_YAW_SAFE_DEG:.0f}° → 0°。"
             )
         else:
-            action_detail = "确认 Tool Rz=0° 中位，机械臂静止保持 15 秒，线束无受力。"
+            action_detail = (
+                "确认 Tool Rz=0° 中位，机械臂静止保持 5 秒，线束无受力；"
+                "本阶段只做安全收尾，不采集磁数据。"
+            )
         message = (
-            f"{step_id} 将按工单执行 15 秒磁阶段：\n{action_detail}\n"
+            f"{step_id} 将按工单执行 {planned_s:.0f} 秒磁阶段：\n{action_detail}\n"
             "阶段完成后机械臂保持或回到示教标定中位。\n\n"
             "请确认完整路径无碰撞、线束无拉扯，人员已离开运动区域。"
         )
@@ -2498,10 +2573,13 @@ class QuickCalWindow(QMainWindow):
         self._auto_action_deadline_ns = now + int(MAG_TIMEOUT_S * 1_000_000_000)
         self._auto_action_stable_since_ns = 0
         self._auto_action_seen_motion = False
-        self._mag_phase = "lead_in"
+        self._mag_phase = "static_settle" if step_id == "M04" else "wait_stage_open"
         self._mag_phase_started_ns = now
         self._mag_segment_index = -1
-        self._mag_reference_pose = tuple(neutral.pose)
+        self._mag_pending_segment_index = -1
+        # Capture the actual entry pose: this is the fixed world frame used by
+        # M01, even when the taught neutral has small repeatability error.
+        self._mag_reference_pose = tuple(state.pose)
         self._mag_original_speed_factor = self._speed_factor_percent(
             state.speed_scaling
         )
@@ -2513,6 +2591,7 @@ class QuickCalWindow(QMainWindow):
             "robot_auto_move_request",
             step_id,
             f"trajectory={path_text}; duration={planned_s:.1f}s; "
+            f"control={'MovL-initial-Tool-frame-RzRy-combined' if step_id == 'M01' else 'MoveJog'}; "
             f"rate={MAG_TARGET_RATE_DEG_S.get(step_id, 0.0):.1f}deg/s; "
             f"Rx_safe={limits.negative_safe_deg:+.1f}..{limits.positive_safe_deg:+.1f}",
         )
@@ -2523,14 +2602,168 @@ class QuickCalWindow(QMainWindow):
         )
         self._update_action_controls()
         if step_id == "M04":
-            self._mag_phase = "wait_stage_open"
-            self.coordinator.condition_stable_since_ns = now - 600_000_000
-            if not self.coordinator.confirm_current_action():
-                self._fail_mag_auto_action("M04 中位静止后的阶段开启复检未通过")
-            else:
-                self._append_log("M04 正在开启中位静止磁阶段", "good")
+            self._append_log("M04 开始中位静止 5 秒；本阶段不采集磁数据", "good")
             return
-        self._start_mag_segment(step_id, 0, state)
+        # Open the stage while still exactly at neutral.  The first jog starts
+        # from the CAPTURING notification so timed paths map to their endpoints
+        # without a pre-capture lead-in angle.
+        self.coordinator.condition_stable_since_ns = now
+        if not self.coordinator.confirm_current_action():
+            self._fail_mag_auto_action(f"{step_id} 中位阶段开启复检未通过")
+        else:
+            self._append_log(f"{step_id} 正在开启磁采集，ACK 后开始运动", "good")
+
+    @staticmethod
+    def _matmul3(left, right):
+        return tuple(
+            tuple(sum(left[row][index] * right[index][column] for index in range(3)) for column in range(3))
+            for row in range(3)
+        )
+
+    def _m01_absolute_targets(self, reference_pose: tuple[float, ...]) -> tuple[tuple[float, ...], ...]:
+        """Build M01 targets in the fixed coordinate system of the entry Tool pose.
+
+        RelMovLTool applies each following rotation in the *current* Tool frame.
+        That makes the second axis drift after the first has rotated.  Here the
+        entry Tool frame is the reference world. Pitch is applied about its
+        fixed Y axis, then Roll is applied about the current Tool Z axis:
+        R = R0 · Ry(pitch) · Rz(roll). Thus the endpoint swings up/down in
+        the initial world while retaining its own Z-axis spin. Targets are
+        converted back to controller Rx/Ry/Rz and sent as absolute TCP poses.
+        """
+        axes = self.coordinator._tool_axes(reference_pose)
+        reference = tuple(tuple(axes[column][row] for column in range(3)) for row in range(3))
+        targets = []
+        for roll_deg, pitch_deg in MAG_M01_COMBINED_WAYPOINTS[1:]:
+            roll = math.radians(roll_deg)
+            pitch = math.radians(pitch_deg)
+            rz = ((math.cos(roll), -math.sin(roll), 0.0), (math.sin(roll), math.cos(roll), 0.0), (0.0, 0.0, 1.0))
+            ry = ((math.cos(pitch), 0.0, math.sin(pitch)), (0.0, 1.0, 0.0), (-math.sin(pitch), 0.0, math.cos(pitch)))
+            matrix = self._matmul3(reference, self._matmul3(ry, rz))
+            controller_ry = math.asin(max(-1.0, min(1.0, -matrix[2][0])))
+            controller_rx = math.atan2(matrix[2][1], matrix[2][2])
+            controller_rz = math.atan2(matrix[1][0], matrix[0][0])
+            targets.append((*reference_pose[:3], *(math.degrees(value) for value in (controller_rx, controller_ry, controller_rz))))
+        return tuple(targets)
+
+    def _m01_fixed_frame_angles(
+        self, reference_pose: tuple[float, ...], current_pose: tuple[float, ...]
+    ) -> tuple[float, float]:
+        """Extract (Roll/Rz, Pitch/Ry) from R0·Ry(pitch)·Rz(roll)."""
+        ref_axes = self.coordinator._tool_axes(reference_pose)
+        cur_axes = self.coordinator._tool_axes(current_pose)
+        reference = tuple(
+            tuple(ref_axes[column][row] for column in range(3))
+            for row in range(3)
+        )
+        current = tuple(
+            tuple(cur_axes[column][row] for column in range(3))
+            for row in range(3)
+        )
+        transpose = tuple(
+            tuple(reference[column][row] for column in range(3))
+            for row in range(3)
+        )
+        relative = self._matmul3(transpose, current)
+        roll_deg = math.degrees(math.atan2(relative[1][0], relative[1][1]))
+        pitch_deg = math.degrees(
+            math.asin(max(-1.0, min(1.0, relative[0][2])))
+        )
+        return roll_deg, pitch_deg
+
+    def _relative_rotation_velocity_percent(
+        self,
+        delta_rz: float,
+        delta_ry: float,
+        duration_s: float,
+        tool: int,
+        speed_scaling: float,
+    ) -> tuple[int, str]:
+        """Map the planned combined-axis rates to a RelMovLTool v percentage."""
+        global_scale = float(speed_scaling)
+        if global_scale > 1.5:
+            global_scale /= 100.0
+        global_scale = max(0.01, min(1.0, global_scale))
+        profiles = {}
+        try:
+            data = json.loads(
+                ROTATION_SPEED_CALIBRATION_FILE.read_text(encoding="utf-8")
+            )
+            profiles = data.get("profiles", {})
+        except (OSError, ValueError, TypeError):
+            profiles = {}
+        required_v = []
+        calibrated_axes = []
+        for axis, delta in (("Rz", delta_rz), ("Ry", delta_ry)):
+            target_rate = abs(float(delta)) / float(duration_s)
+            if target_rate < 1e-9:
+                continue
+            profile = profiles.get(f"tool_{int(tool)}_{axis}", {})
+            rate_per_v = float(
+                profile.get("deg_s_per_v_at_full_global", 0.0) or 0.0
+            )
+            if math.isfinite(rate_per_v) and rate_per_v > 0.0:
+                required_v.append(target_rate / (rate_per_v * global_scale))
+                calibrated_axes.append(axis)
+            else:
+                # Same conservative first-run assumption used by the generic
+                # combined-rotation page: v=100 ≈ 100°/s at full scaling.
+                required_v.append(target_rate / global_scale)
+        velocity = max(1, min(100, round(max(required_v, default=1.0))))
+        source = (
+            f"Tool {int(tool)} {'/'.join(calibrated_axes)} 相对运动标定"
+            if len(calibrated_axes) == 2
+            else "组合运动保守估算"
+        )
+        return velocity, source
+
+    def _start_m01_combined_trajectory(self, state) -> bool:
+        if self._mag_reference_pose is None:
+            self._fail_mag_auto_action("M01 缺少初始 Tool 坐标系参考姿态")
+            return False
+        targets = self._m01_absolute_targets(self._mag_reference_pose)
+        if len(targets) != 8:
+            self._fail_mag_auto_action("M01 固定坐标系组合轨迹无效")
+            return False
+        # A 12% global SpeedFactor cannot complete the largest (~90 degree)
+        # segment in five seconds even at v=100.  Run this timed factory path
+        # at full global speed and restore the operator's factor on completion.
+        if not self.robot.set_speed_factor(MAG_M01_GLOBAL_SPEED_FACTOR):
+            self._fail_mag_auto_action("M01 无法设置 100% 全局速度比例")
+            return False
+        self._mag_speed_factor = MAG_M01_GLOBAL_SPEED_FACTOR
+        self._mag_speed_source = "M01 固定 5 秒分段"
+        previous_target = self._mag_reference_pose
+        for index, (target, waypoint) in enumerate(zip(targets, MAG_M01_COMBINED_WAYPOINTS[1:])):
+            roll_deg, pitch_deg = waypoint
+            segment_angle_deg = self._orientation_error_deg(previous_target, target)
+            velocity = max(1, min(100, round(segment_angle_deg / MAG_M01_SEGMENT_S)))
+            source = f"相邻航点 {segment_angle_deg:.1f}° / {MAG_M01_SEGMENT_S:.1f}s"
+            blend = MAG_M01_BLEND_PERCENT if index < len(targets) - 1 else 0
+            if not self.robot.move_pose_l(
+                target,
+                velocity,
+                user=state.user,
+                tool=state.tool,
+                acceleration_percent=30,
+                blend_percent=blend,
+            ):
+                self._fail_mag_auto_action(
+                    f"M01 固定坐标系组合轨迹第 {index + 1}/{len(targets)} 段发送失败"
+                )
+                return False
+            detail = (
+                f"segment={index + 1}/{len(targets)}; fixed_frame_roll/Rz={roll_deg:+.2f}deg; fixed_frame_pitch/Ry={pitch_deg:+.2f}deg; "
+                f"duration≈{MAG_M01_SEGMENT_S:.1f}s; "
+                f"v={velocity}%; cp={blend}; source={source}"
+            )
+            self.coordinator.recorder.marker(
+                "robot_auto_move_phase", "M01", detail
+            )
+            self._append_log(f"M01 初始 Tool 坐标系 Rz/Ry 组合轨迹：{detail}", "info")
+            previous_target = target
+        self._auto_action_seen_motion = False
+        return True
 
     def _start_mag_segment(self, step_id: str, index: int, state) -> bool:
         trajectory = MAG_TRAJECTORIES[step_id]
@@ -2543,6 +2776,15 @@ class QuickCalWindow(QMainWindow):
                 self._fail_mag_auto_action(f"{step_id} 切换磁动作轴时停止失败")
                 return False
             self._mag_jog_active = False
+            self._mag_pending_segment_index = index
+            self._mag_phase = "wait_segment_stop"
+            self._mag_phase_started_ns = time.monotonic_ns()
+            self._append_log(
+                f"{step_id} 已停止上一段点动，等待机械臂静止后切换到 "
+                f"Tool {axis}{'+' if positive else '-'}",
+                "info",
+            )
+            return True
         rate = MAG_TARGET_RATE_DEG_S[step_id]
         target_rate = rate if positive else -rate
         if self._mag_speed_factor == 0:
@@ -2570,6 +2812,7 @@ class QuickCalWindow(QMainWindow):
             return False
         self._mag_jog_active = True
         self._mag_segment_index = index
+        self._mag_pending_segment_index = -1
         self._auto_action_stable_since_ns = 0
         detail = (
             f"segment={index + 1}/{len(trajectory)}; axis={axis}; "
@@ -2598,12 +2841,11 @@ class QuickCalWindow(QMainWindow):
     def _fail_mag_auto_action(self, message: str) -> None:
         self._stop_mag_jog(restore_speed=False)
         self.robot.stop()
-        self._mag_original_speed_factor = 0
-        self._mag_speed_factor = 0
-        self._mag_speed_source = ""
+        self._restore_mag_speed_factor()
         self._mag_phase = ""
         self._mag_phase_started_ns = 0
         self._mag_segment_index = -1
+        self._mag_pending_segment_index = -1
         self._mag_reference_pose = None
         self._finish_auto_action(message, "error")
         if self.coordinator.running:
@@ -2613,23 +2855,22 @@ class QuickCalWindow(QMainWindow):
         if self._mag_reference_pose is None:
             return "磁翻转缺少标定中位参考姿态"
         if step_id == "M01":
-            rx_deg = self._relative_tool_axis_deg(
-                self._mag_reference_pose, state.pose, "Rx"
+            rz_deg, ry_deg = self._m01_fixed_frame_angles(
+                self._mag_reference_pose, state.pose
             )
-            limits = self.coordinator.limits
-            if not (
-                limits.negative_safe_deg - 1.0
-                <= rx_deg
-                <= limits.positive_safe_deg + 1.0
-            ):
+            if abs(rz_deg) > MAG_M01_ROLL_SAFE_DEG + 5.0:
                 return (
-                    f"Roll/Pitch 翻转越过受限 Tool Rx 安全位：当前 {rx_deg:+.2f}°，"
-                    f"允许 {limits.negative_safe_deg:+.1f}°～"
-                    f"{limits.positive_safe_deg:+.1f}°"
+                    f"Roll 自转越过 M01 初始 Tool 参考系 Tool Rz 安全范围：当前 {rz_deg:+.2f}°，"
+                    f"允许 ±{MAG_M01_ROLL_SAFE_DEG:.1f}°"
+                )
+            if abs(ry_deg) > MAG_M01_PITCH_SAFE_DEG + 5.0:
+                return (
+                    f"Pitch 摆动越过 M01 初始 Tool 参考系 Tool Ry 安全范围：当前 {ry_deg:+.2f}°，"
+                    f"允许 ±{MAG_M01_PITCH_SAFE_DEG:.1f}°"
                 )
         elif step_id in ("M02", "M03"):
             yaw_deg = self._relative_tool_axis_deg(
-                self._mag_reference_pose, state.pose, "Rz"
+                self._mag_reference_pose, state.pose, "Rx"
             )
             margin_deg = 5.0
             lower_deg, upper_deg = (
@@ -2639,7 +2880,7 @@ class QuickCalWindow(QMainWindow):
             )
             if not lower_deg <= yaw_deg <= upper_deg:
                 return (
-                    f"Yaw 单侧往返越过 {step_id} 安全范围：当前 Tool Rz "
+                    f"Yaw 单侧往返越过 {step_id} 安全范围：当前 Tool Rx "
                     f"{yaw_deg:+.2f}°，允许 {lower_deg:+.1f}°～{upper_deg:+.1f}°"
                 )
         return ""
@@ -2657,6 +2898,29 @@ class QuickCalWindow(QMainWindow):
             self._fail_mag_auto_action(f"{step_id} {limit_error}")
             return
         phase = self._mag_phase
+        if phase == "static_settle":
+            if (
+                state.mode != 5
+                or state.linear_speed_norm > 1.0
+                or state.angular_speed_norm > 0.8
+            ):
+                self._fail_mag_auto_action(
+                    "M04 中位静止 5 秒期间检测到机械臂运动"
+                )
+                return
+            hold_s = self.coordinator.current_step.exit_s
+            elapsed_s = (now - self._mag_phase_started_ns) / 1_000_000_000.0
+            if elapsed_s < hold_s:
+                return
+            self.coordinator.condition_stable_since_ns = now - 600_000_000
+            self._mag_phase = "wait_stage_open"
+            if not self.coordinator.confirm_current_action():
+                self._fail_mag_auto_action("M04 中位静止后的阶段标记复检未通过")
+            else:
+                self._append_log(
+                    "M04 已静止满 5 秒，正在发送不采样的阶段标记", "good"
+                )
+            return
         if phase == "lead_in":
             axis, positive, _duration_s = MAG_TRAJECTORIES[step_id][
                 self._mag_segment_index
@@ -2690,6 +2954,45 @@ class QuickCalWindow(QMainWindow):
                 )
             return
         if phase == "wait_stage_open":
+            return
+        if phase == "combined_capturing":
+            if self.coordinator.state != RunState.CAPTURING:
+                return
+            elapsed_s = max(
+                0.0,
+                (now - self.coordinator.capture_started_ns) / 1_000_000_000.0,
+            )
+            moving = state.mode in (7, 8) or state.angular_speed_norm > 0.8
+            if moving:
+                self._auto_action_seen_motion = True
+                return
+            if not self._auto_action_seen_motion and elapsed_s > 2.0:
+                self._fail_mag_auto_action("M01 组合轨迹发送后机械臂未开始运动")
+                return
+            if (
+                self._auto_action_seen_motion
+                and elapsed_s < self.coordinator.current_step.capture_s - 1.0
+            ):
+                self._fail_mag_auto_action(
+                    f"M01 组合轨迹在 {elapsed_s:.1f} 秒提前停止"
+                )
+            return
+        if phase == "wait_segment_stop":
+            if now - self._mag_phase_started_ns > 3_000_000_000:
+                self._fail_mag_auto_action(
+                    f"{step_id} 停止上一段点动后 3 秒内未进入静止状态"
+                )
+                return
+            if (
+                state.mode != 5
+                or state.linear_speed_norm > 1.0
+                or state.angular_speed_norm > 0.8
+            ):
+                return
+            index = self._mag_pending_segment_index
+            self._mag_phase = "capturing"
+            self._mag_phase_started_ns = now
+            self._start_mag_segment(step_id, index, state)
             return
         if phase == "capturing":
             if self.coordinator.state != RunState.CAPTURING:
@@ -2770,12 +3073,15 @@ class QuickCalWindow(QMainWindow):
             self._finish_mag_return(step_id, orientation_error)
 
     def _finish_mag_return(self, step_id: str, orientation_error: float) -> None:
+        step = next(step for step in self.coordinator.steps if step.step_id == step_id)
+        duration_s = step.exit_s if step_id == "M04" else step.capture_s
         self._mag_phase = ""
         self._mag_phase_started_ns = 0
         self._mag_segment_index = -1
+        self._mag_pending_segment_index = -1
         self._mag_reference_pose = None
         self._finish_auto_action(
-            f"{step_id} 已完成 15 秒工单动作并回到标定中位，"
+            f"{step_id} 已完成 {duration_s:.0f} 秒工单动作并回到标定中位，"
             f"姿态偏差 {orientation_error:.2f}°",
             "good",
         )
@@ -3000,11 +3306,11 @@ class QuickCalWindow(QMainWindow):
         self.timeline_summary.setText(
             f"预计工单总时长：{displayed_total_s:.1f} s\n"
             f"预计有效采集时间：{displayed_capture_s:.1f} s\n"
-            "阶段与采集时间来自 V1.3 r024 无磁 QuickCal 协议。\n"
+            "阶段与采集时间来自 QuickCal 15 dps 工单与 r024-fac-magq 协议。\n"
             + (
                 "r024 无磁 QuickCal：正式阶段仅 P1/A01-A06/G01-G06，G06 后回中静止并自动提交。"
                 if self.coordinator.SKIP_MAGNETIC_STAGES
-                else "磁标定流程已启用：G06 后继续执行 M01-M04。"
+                else "磁标定流程已启用：17 个正式阶段，G06 后继续执行 M01-M04。"
             )
         )
         self._populate_workflow()
@@ -3255,7 +3561,8 @@ class QuickCalWindow(QMainWindow):
         self.glove_version_label.setText(f"固件：{frame.revision_tag}｜{frame.imu_model}｜{frame.hand_side}")
         self._append_log(
             f"固件 {frame.revision_tag}，revision={frame.revision}，features=0x{frame.features:02X}，"
-            f"原始流能力={'有' if frame.factory_raw_streams else '无'}，构建 {frame.build_date} {frame.build_time}"
+            f"原始流能力={'有' if frame.factory_raw_streams else '无'}，"
+            f"磁标定能力={'有' if frame.magnetic_factory else '无'}，构建 {frame.build_date} {frame.build_time}"
         )
 
     @staticmethod
@@ -3282,6 +3589,19 @@ class QuickCalWindow(QMainWindow):
         if report.calibrated_count != gyro_ok_count:
             gyro_text += f"（报告头 nCal={report.calibrated_count}）"
         accel_text = f"Accel={accel_ok_count}/{imu_count}"
+        anchor = report.mag_quality.slots[0] if report.mag_quality.slots else None
+        if report.mag_all_ok:
+            mag_text = "Mag=通过"
+        else:
+            reasons = "、".join(report.mag_quality.reject_reasons) or "质量判定失败"
+            mag_text = f"Mag=失败（{reasons}）"
+        if anchor:
+            mag_text += (
+                f" samples={anchor.sample_count}，span=({anchor.span_x},{anchor.span_y},{anchor.span_z})，"
+                f"offset=({anchor.offset_x},{anchor.offset_y},{anchor.offset_z})，"
+                f"scale=({anchor.scale_x1000 / 1000:.3f},{anchor.scale_y1000 / 1000:.3f},"
+                f"{anchor.scale_z1000 / 1000:.3f})"
+            )
 
         if report.status == 0:
             flash_text = f"Flash 已写入（calSeq={report.flash_sequence}）"
@@ -3294,12 +3614,39 @@ class QuickCalWindow(QMainWindow):
         )
         return (
             f"报告 v{report.version}｜{outcome}（status={report.status}）｜"
-            f"{gyro_text}｜{accel_text}｜{flash_text}｜{rms_text}"
+            f"{gyro_text}｜{accel_text}｜{mag_text}｜{flash_text}｜{rms_text}"
         )
 
     @Slot(object)
     def _on_report(self, report) -> None:
         self.report_summary.setText(self._format_report_summary(report))
+        mag = report.mag_quality
+        mag_reasons = "；".join(mag.reject_reasons)
+        mag_status = "通过" if report.mag_all_ok else "失败"
+        self.mag_report_summary.setText(
+            f"总体：{mag_status}｜seenMask=0x{mag.seen_mask:02X}｜"
+            f"rejectFlags=0x{mag.reject_flags:02X}｜"
+            f"{mag_reasons or '无拒绝原因'}"
+        )
+        self.mag_report_table.setRowCount(len(mag.slots))
+        for row, slot in enumerate(mag.slots):
+            values = (
+                f"MMC5983MA #{row + 1}",
+                str(slot.sample_count),
+                str(slot.span_x),
+                str(slot.span_y),
+                str(slot.span_z),
+                str(slot.offset_x),
+                str(slot.offset_y),
+                str(slot.offset_z),
+                f"{slot.scale_x1000 / 1000:.3f} / {slot.scale_y1000 / 1000:.3f} / {slot.scale_z1000 / 1000:.3f}",
+                "通过" if report.mag_all_ok else (mag_reasons or "失败"),
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 9:
+                    item.setForeground(QColor("#087f5b" if report.mag_all_ok else "#dc2626"))
+                self.mag_report_table.setItem(row, column, item)
         for row in range(11):
             gyro = report.gyro_quality[row] if row < len(report.gyro_quality) else None
             accel = report.accel_quality[row] if row < len(report.accel_quality) else None
@@ -3365,18 +3712,36 @@ class QuickCalWindow(QMainWindow):
                 state == RunState.CAPTURING.value
                 and self._mag_phase == "wait_stage_open"
             ):
+                step_id = self._auto_action_step
                 self._mag_phase = (
                     "static_capturing"
-                    if self._auto_action_step == "M04"
+                    if step_id == "M04"
+                    else "combined_capturing"
+                    if step_id == "M01"
                     else "capturing"
                 )
                 self._mag_phase_started_ns = time.monotonic_ns()
+                if step_id != "M04":
+                    latest_state = self.robot.latest_state
+                    if latest_state is None:
+                        self._fail_mag_auto_action(
+                            f"{step_id} 阶段已开启，但缺少机械臂实时状态"
+                        )
+                    elif step_id == "M01":
+                        self._start_m01_combined_trajectory(latest_state)
+                    else:
+                        self._start_mag_segment(step_id, 0, latest_state)
             elif state == RunState.WAIT_STAGE_CLOSE.value and self._mag_phase in (
                 "wait_stage_open",
                 "capturing",
+                "combined_capturing",
                 "static_capturing",
+                "wait_segment_stop",
             ):
-                self._stop_mag_jog(restore_speed=False)
+                if self._auto_action_step == "M01":
+                    self.robot.stop()
+                else:
+                    self._stop_mag_jog(restore_speed=False)
                 self._mag_phase = "wait_jog_stop"
                 self._mag_phase_started_ns = time.monotonic_ns()
         if self._auto_action_step is not None and state in (
@@ -3390,12 +3755,11 @@ class QuickCalWindow(QMainWindow):
                 self._gyro_x_reference_pose = None
             elif step_id in MAG_AUTO_STEPS:
                 self._stop_mag_jog(restore_speed=False)
-                self._mag_original_speed_factor = 0
-                self._mag_speed_factor = 0
-                self._mag_speed_source = ""
+                self._restore_mag_speed_factor()
                 self._mag_phase = ""
                 self._mag_phase_started_ns = 0
                 self._mag_segment_index = -1
+                self._mag_pending_segment_index = -1
                 self._mag_reference_pose = None
             self._finish_auto_action(f"会话已结束，{step_id} 自动动作状态已清除", "error")
         badge_state = "ok" if state == RunState.COMPLETE.value else "warn" if state in (RunState.IDLE.value, RunState.READY.value) else "bad" if state == RunState.ABORTED.value else "warn"
@@ -3606,8 +3970,8 @@ class QuickCalWindow(QMainWindow):
         was_enabled = self._full_auto_enabled
         self._full_auto_enabled = False
         self._full_auto_timer.stop()
-        self._full_auto_safe_return_started_ns = 0
-        self._full_auto_safe_return_seen_motion = False
+        self._full_auto_neutral_return_started_ns = 0
+        self._full_auto_neutral_return_seen_motion = False
         if abort and self.coordinator.running:
             if was_enabled and reason:
                 self._append_log(f"全自动流程停止：{reason}", "error")

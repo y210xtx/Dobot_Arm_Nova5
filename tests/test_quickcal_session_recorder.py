@@ -19,7 +19,7 @@ class SessionRecorderTests(unittest.TestCase):
         recorder = SessionRecorder()
         with tempfile.TemporaryDirectory() as directory:
             session_dir = recorder.start(
-                Path(directory), "SN001", "QC-01", {"firmware": "r024-fac-rawq"}
+                Path(directory), "SN001", "QC-01", {"firmware": "r024-fac-magq"}
             )
             physical = ImuSample(0.0, 0.0, 0.262, 0.0, 0.0, 1.0)
             register = RegisterImuSample(0, 0, 1000, 0, 0, 16384)

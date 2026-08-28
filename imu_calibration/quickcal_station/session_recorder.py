@@ -99,6 +99,7 @@ class SessionRecorder:
                 "factory_intrinsic": frame.factory_intrinsic,
                 "accel_intrinsic": frame.accel_intrinsic,
                 "factory_raw_streams": frame.factory_raw_streams,
+                "magnetic_factory": frame.magnetic_factory,
                 "r024_compatible": frame.r024_compatible,
                 "payload_hex": frame.payload.hex(),
             },
@@ -407,6 +408,11 @@ class SessionRecorder:
                 for item in report.gyro_quality
             ],
             "accel_quality": [asdict(item) for item in report.accel_quality],
+            "mag_all_ok": report.mag_all_ok,
+            "mag_quality": {
+                **asdict(report.mag_quality),
+                "reject_reasons": list(report.mag_quality.reject_reasons),
+            },
             "gyro_matrices": [list(matrix) for matrix in report.gyro_matrices],
             "accel_matrices": [list(matrix) for matrix in report.accel_matrices],
         }

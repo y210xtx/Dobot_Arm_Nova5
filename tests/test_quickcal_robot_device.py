@@ -193,6 +193,27 @@ class RobotDeviceTests(unittest.TestCase):
         self.assertEqual(offsets, (10.0, -5.0, 2.0, 1.0, -2.0, 3.0))
         self.assertEqual(options, {"user": -1, "tool": -1, "a": 20, "v": 25, "cp": 0})
 
+    def test_combined_relative_tool_move_accepts_blend_and_acceleration(self):
+        dashboard = FakeDashboard()
+        robot = RobotDevice()
+        robot.dashboard = dashboard
+
+        self.assertTrue(
+            robot.relative_tool_move(
+                (0.0, 0.0, 0.0, 15.0, -25.0, 0.0),
+                35,
+                acceleration_percent=30,
+                blend_percent=50,
+            )
+        )
+
+        offsets, options = dashboard.calls[0]
+        self.assertEqual(offsets, (0.0, 0.0, 0.0, 15.0, -25.0, 0.0))
+        self.assertEqual(
+            options,
+            {"user": -1, "tool": -1, "a": 30, "v": 35, "cp": 50},
+        )
+
     def test_absolute_tcp_move_uses_pose_mode_and_explicit_frames(self):
         dashboard = FakeDashboard()
         robot = RobotDevice()

@@ -67,6 +67,12 @@ class QuickCalCoordinator(QObject):
     P1_IMU_ACCEL_DELTA_MAX_G = 0.08
     P1_IMU_ACCEL_NORM_MIN_G = 0.70
     P1_IMU_ACCEL_NORM_MAX_G = 1.30
+    # The observed FlexIO/SPI fault produces a one-frame gyro spike while the
+    # same lane's accelerometer becomes exactly zero. Do not confuse one such
+    # corrupt snapshot with physical motion. A real P1 fault must persist for
+    # several consecutive type=9 frames before it can abort the stage.
+    P1_IMU_CORRUPT_ACCEL_NORM_MAX_G = 0.10
+    P1_IMU_FAULT_CONFIRM_FRAMES = 3
 
     # Dobot base +Z points upward, so physical gravity is base -Z.  The active
     # Tool frame must be defined to match the calibration fixture axes.
@@ -74,9 +80,12 @@ class QuickCalCoordinator(QObject):
     ACCEL_FACE_WARNING_DEG = 2.0
     ACCEL_FACE_MAX_DEG = 5.0
     MAG_COVERAGE_SPEED_DEG_S = 1.0
-    MAG_DYNAMIC_DEVIATION_GRACE_NS = 800_000_000
-    # r024-fac-rawq workflow: G06 is followed directly by MCAL_COMMIT.
-    SKIP_MAGNETIC_STAGES = True
+    # MoveJog axis changes are stop-confirm-start operations.  Allow the robot
+    # controller enough time to decelerate and report idle without treating the
+    # deliberate transition as lost magnetic motion.
+    MAG_DYNAMIC_DEVIATION_GRACE_NS = 2_000_000_000
+    # r024-fac-magq workflow: G06 is followed by required M01..M04 magnetic stages.
+    SKIP_MAGNETIC_STAGES = False
     ACCEL_FACE_TARGETS = {
         "A01": ("+X", (1.0, 0.0, 0.0)),
         "A02": ("-X", (-1.0, 0.0, 0.0)),
@@ -139,6 +148,10 @@ class QuickCalCoordinator(QObject):
         self.p1_imu_checked_frames = 0
         self.p1_imu_motion_error = ""
         self.p1_previous_accel: tuple[tuple[float, float, float], ...] | None = None
+        self.p1_imu_fault_kind = ""
+        self.p1_imu_fault_count = 0
+        self.p1_imu_transient_issue = False
+        self.p1_imu_rejected_frames = 0
 
         self.tick_timer = QTimer(self)
         self.tick_timer.setInterval(100)
@@ -252,6 +265,8 @@ class QuickCalCoordinator(QObject):
                 )
             if not self.version.factory_raw_streams:
                 errors.append("固件未声明 r024 原始流能力（feature 0x80）")
+            if not self.version.magnetic_factory:
+                errors.append("固件未声明磁标定工序/质量报告能力（feature 0x10）")
         raw_error = self._raw_health_error(now)
         if raw_error:
             errors.append(raw_error)
@@ -346,7 +361,7 @@ class QuickCalCoordinator(QObject):
             "imu_model": self.version.imu_model,
             "hand_side": self.version.hand_side,
             "workflow": "QuickCal V1 Robot Control Steps",
-            "workflow_source": "动捕手套工厂内参标定通信协议_V1.3_r024_无磁QuickCal_原始流.md",
+            "workflow_source": "QuickCal_V1_Robot_Control_Steps_15dps.xlsx + r024-fac-magq type7 v4",
             "magnetic_stages_skipped": self.SKIP_MAGNETIC_STAGES,
             "magnetic_skip_reason": (
                 "r024 no-magnetic QuickCal; submit directly after G06"
@@ -405,6 +420,10 @@ class QuickCalCoordinator(QObject):
         self.p1_imu_checked_frames = 0
         self.p1_imu_motion_error = ""
         self.p1_previous_accel = None
+        self.p1_imu_fault_kind = ""
+        self.p1_imu_fault_count = 0
+        self.p1_imu_transient_issue = False
+        self.p1_imu_rejected_frames = 0
         self._reset_motion_coverage()
         self.recorder.marker("session_begin", "P0", str(directory))
         self._set_state(RunState.WAIT_BEGIN_ACK)
@@ -416,6 +435,11 @@ class QuickCalCoordinator(QObject):
         if self.SKIP_MAGNETIC_STAGES:
             self.status_message.emit(
                 "r024 无磁 QuickCal：G06 后禁止发送 M01-M04，回中静止后自动提交",
+                "good",
+            )
+        else:
+            self.status_message.emit(
+                "r024 磁标定 QuickCal：G06 后继续执行 M01-M04，提交时磁质量必须通过",
                 "good",
             )
         return True
@@ -566,7 +590,7 @@ class QuickCalCoordinator(QObject):
             for step, status, detail in zip(self.steps, self.step_status, self.step_detail)
         }
 
-    def _check_motion_condition(self, step: QuickCalStep) -> str:
+    def _check_motion_condition(self, step: QuickCalStep, *, require_settle: bool = True) -> str:
         state = self.latest_robot_state
         if state is None or time.monotonic_ns() - state.received_monotonic_ns > self.ROBOT_FRESH_NS:
             self.condition_stable_since_ns = 0
@@ -617,33 +641,32 @@ class QuickCalCoordinator(QObject):
             if gyro_error:
                 self.condition_stable_since_ns = 0
                 return gyro_error
-        if step.step_id.startswith("M") and step.step_id != "M04":
+        if step.step_id.startswith("M"):
+            # Magnetic stages are opened at the taught neutral pose.  The
+            # window starts the timed jog after the open ACK, so the work-order
+            # duration maps to 0→endpoint→0 without an uncounted lead-in angle.
             if (
-                state.mode not in self.ROBOT_DYNAMIC_MODES
-                or state.angular_speed_norm < 1.0
+                state.mode != self.ROBOT_MODE_IDLE
+                or state.angular_speed_norm > 0.8
+                or state.linear_speed_norm > 1.0
             ):
                 self.condition_stable_since_ns = 0
-                return "磁标定要求机械臂已进入连续慢速扫转"
-            if state.angular_speed_norm > 90.0:
-                self.condition_stable_since_ns = 0
-                return f"磁扫转速度过高：{state.angular_speed_norm:.1f}°/s"
-            motion_error = self._mag_motion_error(state)
-            if motion_error:
-                self.condition_stable_since_ns = 0
-                return motion_error
+                return (
+                    "磁阶段必须从标定中位静止开启，当前线速度 "
+                    f"{state.linear_speed_norm:.2f} mm/s，角速度 "
+                    f"{state.angular_speed_norm:.2f}°/s"
+                )
         required_stable_s = 0.0
         if step.step_id in ("P1", "A01", "A02", "A03", "A04", "A05", "A06"):
             required_stable_s = step.settle_s
         elif step.step_id.startswith("G"):
             required_stable_s = step.settle_s
-        elif step.step_id == "M04":
-            required_stable_s = 0.5
         elif step.step_id.startswith("M"):
-            required_stable_s = 0.3
+            required_stable_s = 0.0
         elif step.step_id in ("S01", "S02"):
             required_stable_s = 0.5
         now = time.monotonic_ns()
-        if required_stable_s > 0:
+        if require_settle and required_stable_s > 0:
             if self.condition_stable_since_ns == 0:
                 self.condition_stable_since_ns = now
             stable_s = (now - self.condition_stable_since_ns) / 1_000_000_000.0
@@ -692,16 +715,16 @@ class QuickCalCoordinator(QObject):
         if step_id == "M04":
             return ""
         if step_id == "M01":
-            required = ("x_positive", "x_negative", "y_positive", "y_negative")
+            required = ("z_positive", "z_negative", "y_positive", "y_negative")
             missing = [name for name in required if not self.motion_coverage[name]]
             if missing:
-                return "M01 Roll/Pitch 覆盖不足：Tool Rx/Ry 必须均包含正、反向运动"
+                return "M01 Roll/Pitch 覆盖不足：Tool Rz/Ry 必须均包含正、反向运动"
             return ""
         if not (
-            self.motion_coverage["z_positive"]
-            and self.motion_coverage["z_negative"]
+            self.motion_coverage["x_positive"]
+            and self.motion_coverage["x_negative"]
         ):
-            return f"{step_id} Yaw 往返覆盖不足：Tool Rz 必须包含正、反向运动"
+            return f"{step_id} Yaw 往返覆盖不足：Tool Rx 必须包含正、反向运动"
         return ""
 
     def _relative_tool_axis_deg(self, pose, axis: str) -> float | None:
@@ -737,12 +760,12 @@ class QuickCalCoordinator(QObject):
         if step_id == "M01":
             if not any(
                 abs(tool_speed[index]) >= self.MAG_COVERAGE_SPEED_DEG_S
-                for index in (0, 1)
+                for index in (1, 2)
             ):
-                return "M01 要求机械臂保持 Tool Rx/Ry 连续慢速翻转"
+                return "M01 要求机械臂保持 Tool Rz/Ry 连续慢速翻转"
         elif step_id in ("M02", "M03"):
-            if abs(tool_speed[2]) < self.MAG_COVERAGE_SPEED_DEG_S:
-                return f"{step_id} 要求机械臂保持 Tool Rz 慢速往返"
+            if abs(tool_speed[0]) < self.MAG_COVERAGE_SPEED_DEG_S:
+                return f"{step_id} 要求机械臂保持 Tool Rx 慢速往返"
         return ""
 
     @staticmethod
@@ -919,7 +942,12 @@ class QuickCalCoordinator(QObject):
             else:
                 self.dynamic_motion_lost_since_ns = 0
         else:
-            motion_error = self._check_motion_condition(self.current_step)
+            # The pre-capture settle interval is a start gate only.  During a
+            # capture we still require a fresh, stationary robot and healthy P1
+            # stream, but must not reinterpret a reset settle timer as a fault.
+            motion_error = self._check_motion_condition(
+                self.current_step, require_settle=False
+            )
             if motion_error:
                 return motion_error
         return ""
@@ -991,7 +1019,10 @@ class QuickCalCoordinator(QObject):
                 return
             detail = "阶段正常关闭（固件返回值 11）；最终质量待 MCAL_COMMIT/type=7"
             if step.step_id == "P1":
-                detail += f"；上位机联合核验 type=9 {self.p1_imu_checked_frames} 帧"
+                detail += (
+                    f"；上位机联合核验 type=9 {self.p1_imu_checked_frames} 帧，"
+                    f"剔除异常帧 {self.p1_imu_rejected_frames} 帧"
+                )
             if self.valid_mag_pairs_this_step or self.invalid_mag_pairs_this_step:
                 detail += (
                     f"；可选 type=12 诊断：有效 {self.valid_mag_pairs_this_step}，"
@@ -1064,6 +1095,18 @@ class QuickCalCoordinator(QObject):
                 for index, item in enumerate(report.accel_quality)
                 if not item.ok
             ]
+            mag_failure = ""
+            if not report.mag_all_ok:
+                reasons = list(report.mag_quality.reject_reasons)
+                if not reasons:
+                    reasons.append("固件磁质量判定失败")
+                anchor = report.mag_quality.slots[0] if report.mag_quality.slots else None
+                coverage = (
+                    f"samples={anchor.sample_count}; span=({anchor.span_x},{anchor.span_y},{anchor.span_z})"
+                    if anchor
+                    else "无 MMC5983MA 质量数据"
+                )
+                mag_failure = f"Mag失败：{'、'.join(reasons)}；{coverage}"
             raw_issues = self.recorder.raw_diagnostic_issues(IMU_NAMES)
             ack = self.commit_ack_frame
             ack_text = (
@@ -1080,13 +1123,15 @@ class QuickCalCoordinator(QObject):
                 details.append("Gyro失败：" + "；".join(gyro_failures))
             if accel_failures:
                 details.append("Accel失败：" + "；".join(accel_failures))
+            if mag_failure:
+                details.append(mag_failure)
             if raw_issues:
                 details.append("原始流提示：" + "；".join(raw_issues[:12]))
             self.abort(
                 "参数求解/Flash 未通过｜" + "｜".join(details)
             )
             return
-        detail = f"Gyro 11/11，Accel 11/11，Flash seq={report.flash_sequence}，平均 RMS={report.mean_rms_mdeg / 1000:.3f}°"
+        detail = f"Gyro 11/11，Accel 11/11，Mag通过，Flash seq={report.flash_sequence}，平均 RMS={report.mean_rms_mdeg / 1000:.3f}°"
         self._set_step(self.current_index, "完成", detail)
         self.recorder.marker("commit_complete", "S01", detail)
         self._advance()
@@ -1102,6 +1147,11 @@ class QuickCalCoordinator(QObject):
         ):
             self.p1_imu_checked_frames += 1
             self.p1_imu_motion_error = self._evaluate_p1_imu_frame(frame)
+            if self.p1_imu_transient_issue:
+                # A suspect frame is not allowed to contribute to the two-second
+                # stillness timer, but one isolated sample glitch must not abort
+                # an active 30-second P1 capture either.
+                self.condition_stable_since_ns = 0
             if self.p1_imu_motion_error:
                 self.condition_stable_since_ns = 0
                 if self.state in (RunState.WAIT_STAGE_OPEN, RunState.CAPTURING) and not self._capture_fault:
@@ -1109,25 +1159,75 @@ class QuickCalCoordinator(QObject):
         if self.state in (RunState.CAPTURING, RunState.WAIT_STAGE_CLOSE):
             self.recorder.raw_imu(self.current_step.step_id, frame)
 
+    def _confirm_p1_imu_fault(self, kind: str, detail: str) -> str:
+        if self.p1_imu_fault_kind == kind:
+            self.p1_imu_fault_count += 1
+        else:
+            self.p1_imu_fault_kind = kind
+            self.p1_imu_fault_count = 1
+        self.p1_imu_transient_issue = (
+            self.p1_imu_fault_count < self.P1_IMU_FAULT_CONFIRM_FRAMES
+        )
+        if self.p1_imu_transient_issue:
+            return ""
+        return (
+            f"{detail}；已连续 {self.p1_imu_fault_count} 帧，"
+            "排除单帧采样毛刺后确认"
+        )
+
+    def _clear_p1_imu_fault(self) -> None:
+        self.p1_imu_fault_kind = ""
+        self.p1_imu_fault_count = 0
+        self.p1_imu_transient_issue = False
+
     def _evaluate_p1_imu_frame(self, frame) -> str:
         if frame.presence_mask & ALL_IMU_MASK != ALL_IMU_MASK or len(frame.samples) != 11:
             self.p1_previous_accel = None
-            return f"P1 IMU 在线不足：presence_mask=0x{frame.presence_mask & ALL_IMU_MASK:04X}"
+            return self._confirm_p1_imu_fault(
+                "presence",
+                f"P1 IMU 在线不足：presence_mask=0x{frame.presence_mask & ALL_IMU_MASK:04X}",
+            )
         accel_vectors = tuple(
             (float(sample.ax), float(sample.ay), float(sample.az))
             for sample in frame.samples
         )
+        accel_norms = tuple(math.sqrt(ax * ax + ay * ay + az * az) for ax, ay, az in accel_vectors)
+
+        # A mounted, powered IMU cannot measure 0 g on all three axes while the
+        # other ten lanes measure gravity. This signature has repeatedly been
+        # observed together with the false 0.274/9.697 rad/s spikes. Discard it
+        # before gyro and inter-frame acceleration checks; also clear the prior
+        # accel snapshot so recovery from the bad frame is not called vibration.
+        corrupt_indices = tuple(
+            index
+            for index, value in enumerate(accel_norms)
+            if value < self.P1_IMU_CORRUPT_ACCEL_NORM_MAX_G
+        )
+        if corrupt_indices:
+            self.p1_previous_accel = None
+            self.p1_imu_rejected_frames += 1
+            names = ", ".join(
+                IMU_NAMES[index] if index < len(IMU_NAMES) else str(index)
+                for index in corrupt_indices
+            )
+            return self._confirm_p1_imu_fault(
+                "corrupt-zero-accel",
+                f"P1 IMU 原始帧异常：{names} 加速度接近 0 g",
+            )
+
         max_gyro = max(
             math.sqrt(sample.gx * sample.gx + sample.gy * sample.gy + sample.gz * sample.gz)
             for sample in frame.samples
         )
         if max_gyro > self.P1_IMU_GYRO_MAX_RAD_S:
             self.p1_previous_accel = accel_vectors
-            return (
-                f"P1 IMU 检测到转动：最大角速度 {max_gyro:.3f} rad/s，"
-                f"限值 {self.P1_IMU_GYRO_MAX_RAD_S:.3f} rad/s"
+            return self._confirm_p1_imu_fault(
+                "gyro-motion",
+                (
+                    f"P1 IMU 检测到持续转动：最大角速度 {max_gyro:.3f} rad/s，"
+                    f"限值 {self.P1_IMU_GYRO_MAX_RAD_S:.3f} rad/s"
+                ),
             )
-        accel_norms = tuple(math.sqrt(ax * ax + ay * ay + az * az) for ax, ay, az in accel_vectors)
         invalid_norm = next(
             (
                 value
@@ -1140,13 +1240,17 @@ class QuickCalCoordinator(QObject):
         )
         if invalid_norm is not None:
             self.p1_previous_accel = accel_vectors
-            return (
-                f"P1 IMU 加速度幅值异常：{invalid_norm:.3f} g，允许 "
-                f"{self.P1_IMU_ACCEL_NORM_MIN_G:.2f}～{self.P1_IMU_ACCEL_NORM_MAX_G:.2f} g"
+            return self._confirm_p1_imu_fault(
+                "accel-norm",
+                (
+                    f"P1 IMU 加速度幅值持续异常：{invalid_norm:.3f} g，允许 "
+                    f"{self.P1_IMU_ACCEL_NORM_MIN_G:.2f}～{self.P1_IMU_ACCEL_NORM_MAX_G:.2f} g"
+                ),
             )
         previous = self.p1_previous_accel
         self.p1_previous_accel = accel_vectors
         if previous is None:
+            self._clear_p1_imu_fault()
             return ""
         max_delta = max(
             math.sqrt(
@@ -1157,10 +1261,14 @@ class QuickCalCoordinator(QObject):
             for current, prior in zip(accel_vectors, previous)
         )
         if max_delta > self.P1_IMU_ACCEL_DELTA_MAX_G:
-            return (
-                f"P1 IMU 检测到振动：相邻帧最大加速度变化 {max_delta:.3f} g，"
-                f"限值 {self.P1_IMU_ACCEL_DELTA_MAX_G:.3f} g"
+            return self._confirm_p1_imu_fault(
+                "accel-vibration",
+                (
+                    f"P1 IMU 检测到持续振动：相邻帧最大加速度变化 {max_delta:.3f} g，"
+                    f"限值 {self.P1_IMU_ACCEL_DELTA_MAX_G:.3f} g"
+                ),
             )
+        self._clear_p1_imu_fault()
         return ""
 
     @Slot(object)

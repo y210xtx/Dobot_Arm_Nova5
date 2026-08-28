@@ -13,6 +13,9 @@ try:
     from imu_calibration.quickcal_station.robot_device import RobotState
     from imu_calibration.quickcal_station.window import (
         MAG_AUTO_STEPS,
+        MAG_M01_BLEND_PERCENT,
+        MAG_M01_COMBINED_WAYPOINTS,
+        MAG_M01_SEGMENT_S,
         MAG_TRAJECTORIES,
         QuickCalWindow,
     )
@@ -20,7 +23,8 @@ except ModuleNotFoundError as exc:
     if exc.name != "PySide6":
         raise
     QuickCalCoordinator = QuickCalWindow = RobotState = RunState = None
-    MAG_AUTO_STEPS = MAG_TRAJECTORIES = None
+    MAG_AUTO_STEPS = MAG_M01_BLEND_PERCENT = MAG_M01_COMBINED_WAYPOINTS = MAG_TRAJECTORIES = None
+    MAG_M01_SEGMENT_S = None
 
 
 class ManualMotionHarness:
@@ -91,6 +95,8 @@ class GyroMotionHarness:
 class MagneticMotionHarness:
     if QuickCalWindow is not None:
         _relative_tool_axis_deg = QuickCalWindow._relative_tool_axis_deg
+        _matmul3 = staticmethod(QuickCalWindow._matmul3)
+        _m01_fixed_frame_angles = QuickCalWindow._m01_fixed_frame_angles
         _mag_limit_error = QuickCalWindow._mag_limit_error
 
     def __init__(self):
@@ -131,8 +137,8 @@ class FullAutoHarness:
     def _start_mag_auto_action(self, step_id):
         self.calls.append(("mag", step_id))
 
-    def _update_full_auto_safe_return(self):
-        self.calls.append(("safe", "S02"))
+    def _update_full_auto_neutral_return(self):
+        self.calls.append(("neutral", "S02"))
         return True
 
     def _show_error(self, message, modal):
@@ -275,33 +281,60 @@ class GyroMotionParameterTests(unittest.TestCase):
             },
         )
 
-    def test_magnetic_trajectories_keep_work_order_actions_at_fifteen_seconds(self):
+    def test_magnetic_trajectories_match_latest_work_order_times_and_endpoints(self):
         self.assertEqual(tuple(MAG_TRAJECTORIES), MAG_AUTO_STEPS)
-        for step_id in ("M01", "M02", "M03"):
-            with self.subTest(step_id=step_id):
-                self.assertAlmostEqual(
-                    sum(duration_s for _axis, _positive, duration_s in MAG_TRAJECTORIES[step_id]),
-                    15.0,
+        self.assertEqual(
+            {
+                step_id: sum(
+                    duration_s
+                    for _axis, _positive, duration_s in MAG_TRAJECTORIES[step_id]
                 )
-
-        m01 = MAG_TRAJECTORIES["M01"]
-        self.assertEqual({axis for axis, _positive, _duration in m01}, {"Rx", "Ry"})
-        for axis in ("Rx", "Ry"):
-            self.assertEqual(
-                {
-                    positive
-                    for segment_axis, positive, _duration in m01
-                    if segment_axis == axis
-                },
-                {False, True},
-            )
+                for step_id in ("M02", "M03")
+            },
+            {"M02": 10.0, "M03": 10.0},
+        )
+        self.assertEqual(MAG_TRAJECTORIES["M01"], ())
+        self.assertAlmostEqual(
+            (len(MAG_M01_COMBINED_WAYPOINTS) - 1) * MAG_M01_SEGMENT_S,
+            40.0,
+        )
+        self.assertEqual(MAG_M01_COMBINED_WAYPOINTS[0], (0.0, 0.0))
+        self.assertEqual(MAG_M01_COMBINED_WAYPOINTS[-1], (0.0, 0.0))
+        self.assertAlmostEqual(
+            max(point[0] for point in MAG_M01_COMBINED_WAYPOINTS), 75.0
+        )
+        self.assertAlmostEqual(
+            min(point[0] for point in MAG_M01_COMBINED_WAYPOINTS), -75.0
+        )
+        self.assertAlmostEqual(
+            max(point[1] for point in MAG_M01_COMBINED_WAYPOINTS), 75.0
+        )
+        self.assertAlmostEqual(
+            min(point[1] for point in MAG_M01_COMBINED_WAYPOINTS), -75.0
+        )
+        harness = SimpleNamespace(
+            coordinator=SimpleNamespace(_tool_axes=QuickCalCoordinator._tool_axes),
+            _matmul3=QuickCalWindow._matmul3,
+        )
+        targets = QuickCalWindow._m01_absolute_targets(
+            harness, (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        )
+        self.assertEqual(len(targets), 8)
+        self.assertEqual(MAG_M01_BLEND_PERCENT, 100)
+        # With an identity entry pose the absolute controller targets are the
+        # intended fixed-frame Rz/Ry Roll/Pitch waypoints.
+        self.assertTrue(all(target[:3] == (0.0, 0.0, 0.0) for target in targets))
+        self.assertAlmostEqual(targets[1][5], 75.0)
+        self.assertAlmostEqual(targets[-1][3], 0.0)
+        self.assertAlmostEqual(targets[-1][4], 0.0)
+        self.assertAlmostEqual(targets[-1][5], 0.0)
         self.assertEqual(
             MAG_TRAJECTORIES["M02"],
-            (("Rz", True, 7.5), ("Rz", False, 7.5)),
+            (("Rx", True, 5.0), ("Rx", False, 5.0)),
         )
         self.assertEqual(
             MAG_TRAJECTORIES["M03"],
-            (("Rz", False, 7.5), ("Rz", True, 7.5)),
+            (("Rx", False, 5.0), ("Rx", True, 5.0)),
         )
         self.assertEqual(MAG_TRAJECTORIES["M04"], ())
 
@@ -310,26 +343,45 @@ class GyroMotionParameterTests(unittest.TestCase):
 
         self.assertEqual(
             harness._mag_limit_error(
-                "M01", SimpleNamespace(pose=(0.0, 0.0, 0.0, 45.0, 0.0, 0.0))
-            ),
-            "",
-        )
-        self.assertIn(
-            "Tool Rx",
-            harness._mag_limit_error(
-                "M01", SimpleNamespace(pose=(0.0, 0.0, 0.0, 47.0, 0.0, 0.0))
-            ),
-        )
-        self.assertEqual(
-            harness._mag_limit_error(
-                "M02", SimpleNamespace(pose=(0.0, 0.0, 0.0, 0.0, 0.0, 75.0))
+                "M01", SimpleNamespace(pose=(0.0, 0.0, 0.0, 0.0, 0.0, 75.0))
             ),
             "",
         )
         self.assertIn(
             "Tool Rz",
             harness._mag_limit_error(
-                "M03", SimpleNamespace(pose=(0.0, 0.0, 0.0, 0.0, 0.0, -81.0))
+                "M01", SimpleNamespace(pose=(0.0, 0.0, 0.0, 0.0, 0.0, 81.0))
+            ),
+        )
+        self.assertEqual(
+            harness._mag_limit_error(
+                "M01", SimpleNamespace(pose=(0.0, 0.0, 0.0, 0.0, 75.0, 0.0))
+            ),
+            "",
+        )
+        self.assertIn(
+            "Tool Ry",
+            harness._mag_limit_error(
+                "M01", SimpleNamespace(pose=(0.0, 0.0, 0.0, 0.0, 81.0, 0.0))
+            ),
+        )
+        # M01 combines fixture-mapped Tool Rz (Roll) and Tool Ry (Pitch).
+        self.assertEqual(
+            harness._mag_limit_error(
+                "M01", SimpleNamespace(pose=(0.0, 0.0, 0.0, 0.0, 75.0, 31.82))
+            ),
+            "",
+        )
+        self.assertEqual(
+            harness._mag_limit_error(
+                "M02", SimpleNamespace(pose=(0.0, 0.0, 0.0, 45.0, 0.0, 0.0))
+            ),
+            "",
+        )
+        self.assertIn(
+            "Tool Rx",
+            harness._mag_limit_error(
+                "M03", SimpleNamespace(pose=(0.0, 0.0, 0.0, -51.0, 0.0, 0.0))
             ),
         )
         self.assertEqual(
@@ -345,7 +397,7 @@ class GyroMotionParameterTests(unittest.TestCase):
             "A01": [("accel", "A01", None)],
             "G02": [("gyro", "G02")],
             "S01": [("confirm", "S01")],
-            "S02": [("safe", "S02"), ("confirm", "S02")],
+            "S02": [("neutral", "S02"), ("confirm", "S02")],
         }
         for step_id, expected in cases.items():
             with self.subTest(step_id=step_id):
@@ -374,7 +426,7 @@ class ReportSummaryTests(unittest.TestCase):
         )
         accel_quality = tuple(SimpleNamespace(ok=True) for _ in range(11))
         return SimpleNamespace(
-            version=3,
+            version=4,
             status=11,
             imu_count=11,
             calibrated_count=0,
@@ -383,6 +435,22 @@ class ReportSummaryTests(unittest.TestCase):
             gyro_quality=gyro_quality,
             accel_quality=accel_quality,
             gyro_all_ok=False,
+            mag_all_ok=False,
+            mag_quality=SimpleNamespace(
+                reject_reasons=("MMC5983MA X 轴覆盖不足",),
+                slots=(SimpleNamespace(
+                    sample_count=20,
+                    span_x=100,
+                    span_y=500,
+                    span_z=500,
+                    offset_x=1,
+                    offset_y=2,
+                    offset_z=3,
+                    scale_x1000=1000,
+                    scale_y1000=1000,
+                    scale_z1000=1000,
+                ),),
+            ),
             factory_pass=False,
         )
 
@@ -392,6 +460,7 @@ class ReportSummaryTests(unittest.TestCase):
         self.assertIn("未通过：质量不足（status=11）", text)
         self.assertIn("Gyro=3/11（报告头 nCal=0）", text)
         self.assertIn("Accel=11/11", text)
+        self.assertIn("Mag=失败", text)
         self.assertIn("本次 Flash 未写入｜当前 calSeq=4", text)
         self.assertIn("平均 RMS=--", text)
 

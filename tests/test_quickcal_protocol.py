@@ -3,6 +3,7 @@ import unittest
 
 from imu_calibration.quickcal_station.protocol import (
     CMD_MCAL_BEGIN,
+    EXPECTED_GYRO_SEGMENTS,
     EXPECTED_MCAL_PAYLOAD_LENGTH,
     TYPE_RAW_IMU,
     ProtocolParser,
@@ -47,12 +48,13 @@ class ProtocolTests(unittest.TestCase):
         payload[0] = 0x08
         payload[1] = 1
         struct.pack_into("<H", payload, 2, 24)
-        payload[4:17] = b"r024-fac-rawq"
-        payload[41] = 0xE0
+        payload[4:17] = b"r024-fac-magq"
+        payload[41] = 0xF0
         version = ProtocolParser()._parse_version(bytes(payload))
         self.assertTrue(version.factory_intrinsic)
         self.assertTrue(version.accel_intrinsic)
         self.assertTrue(version.factory_raw_streams)
+        self.assertTrue(version.magnetic_factory)
         self.assertTrue(version.r024_compatible)
         self.assertEqual(version.payload, bytes(payload))
         with self.assertRaises(ValueError):
@@ -62,28 +64,36 @@ class ProtocolTests(unittest.TestCase):
     def valid_mcal_payload() -> bytes:
         payload = bytearray(EXPECTED_MCAL_PAYLOAD_LENGTH)
         payload[0] = 0x11
-        payload[1] = 3
+        payload[1] = 4
         payload[2] = 11
         payload[3] = 11
         payload[6] = 0
-        payload[7] = 0x03
+        payload[7] = 0x07
         identity = struct.pack("<9f", 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
         for index in range(11):
             gyro_quality = 12 + index * 8
             payload[gyro_quality] = 1
-            struct.pack_into("<H", payload, gyro_quality + 4, 40)
+            struct.pack_into("<H", payload, gyro_quality + 4, EXPECTED_GYRO_SEGMENTS)
             payload[100 + index * 36 : 100 + (index + 1) * 36] = identity
 
             accel_quality = 496 + index * 14
             payload[accel_quality] = 1
             payload[650 + index * 36 : 650 + (index + 1) * 36] = identity
+        mag_offset = 1046
+        payload[mag_offset] = 1
+        payload[mag_offset + 2] = 0x01
+        payload[mag_offset + 3] = 3
+        struct.pack_into("<H", payload, mag_offset + 4, 225)
+        struct.pack_into("<3H", payload, mag_offset + 6, 800, 900, 1000)
+        struct.pack_into("<3H", payload, mag_offset + 18, 1000, 1000, 1000)
         return bytes(payload)
 
-    def test_type7_v3_requires_full_report_and_matrices(self):
+    def test_type7_v4_requires_full_report_matrices_and_mag_quality(self):
         report = ProtocolParser()._parse_mcal(7, self.valid_mcal_payload())
         self.assertTrue(report.format_valid)
         self.assertTrue(report.gyro_all_ok)
         self.assertTrue(report.accel_all_ok)
+        self.assertTrue(report.mag_all_ok)
         self.assertTrue(report.factory_pass)
         self.assertEqual(len(report.gyro_matrices), 11)
         self.assertEqual(len(report.accel_matrices), 11)
@@ -97,13 +107,13 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parser._parse_mcal(1, bytes(wrong_version))
 
-    def test_type7_requires_gyro_flag_and_all_forty_windows(self):
+    def test_type7_requires_gyro_flag_and_minimum_windows(self):
         missing_flag = bytearray(self.valid_mcal_payload())
-        missing_flag[7] = 0x02
+        missing_flag[7] = 0x06
         self.assertFalse(ProtocolParser()._parse_mcal(1, bytes(missing_flag)).gyro_all_ok)
 
         too_few_segments = bytearray(self.valid_mcal_payload())
-        struct.pack_into("<H", too_few_segments, 12 + 4, 39)
+        struct.pack_into("<H", too_few_segments, 12 + 4, EXPECTED_GYRO_SEGMENTS - 1)
         self.assertFalse(ProtocolParser()._parse_mcal(1, bytes(too_few_segments)).gyro_all_ok)
 
         rejected = bytearray(self.valid_mcal_payload())
@@ -123,17 +133,34 @@ class WorkflowTests(unittest.TestCase):
         self.assertAlmostEqual(limits.positive_safe_deg, 45.0)
         self.assertAlmostEqual(limits.capture_s, 6.0)
         steps = steps_for_limits(limits)
-        self.assertEqual(len(steps), 16)
-        self.assertAlmostEqual(expected_total_seconds(limits), 267.0)
-        self.assertAlmostEqual(expected_capture_seconds(limits), 100.0)
+        self.assertEqual(len(steps), 20)
+        self.assertAlmostEqual(expected_total_seconds(limits), 332.0)
+        self.assertAlmostEqual(expected_capture_seconds(limits), 160.0)
         formal = [step for step in steps if step.stage_code is not None]
-        self.assertEqual(len(formal), 13)
+        self.assertEqual(len(formal), 17)
         self.assertEqual([step.stage_code for step in formal], [
             0x01,
             *range(0x10, 0x16),
             *range(0x20, 0x26),
+            *range(0x30, 0x34),
         ])
-        self.assertFalse(any(step.step_id.startswith("M") for step in steps))
+        self.assertEqual(
+            [step.step_id for step in steps if step.step_id.startswith("M")],
+            ["M01", "M02", "M03", "M04"],
+        )
+        magnetic = {step.step_id: step for step in steps if step.step_id.startswith("M")}
+        self.assertEqual(
+            {
+                step_id: (step.capture_s, step.exit_s)
+                for step_id, step in magnetic.items()
+            },
+            {
+                "M01": (40, 0),
+                "M02": (10, 0),
+                "M03": (10, 0),
+                "M04": (0, 5),
+            },
+        )
 
     def test_dynamic_stage_meanings_and_measured_x_limit_formula(self):
         limits = YawLimits()

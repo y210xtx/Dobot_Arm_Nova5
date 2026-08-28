@@ -9,6 +9,7 @@ from .protocol import (
     MCAL_CAPTURE_ACCEL,
     MCAL_CAPTURE_GYRO_BIAS,
     MCAL_CAPTURE_GYRO_M,
+    MCAL_CAPTURE_MAG,
 )
 
 
@@ -144,8 +145,12 @@ QUICKCAL_STEPS = (
     QuickCalStep("G04", "陀螺", "-Y，15 deg/s", "沿 G03 同一配置 Tool 轴反向扫转；仅中间 ±75° 匀速平台记录", "实际速度稳定；无夹具滑动", 2, 1, 10, 2, 0x23, MCAL_CAPTURE_GYRO_M, "11 路 Gyro/Acc 原始值、实际角速度", "加速/减速/回中位未进入采集窗口"),
     QuickCalStep("G05", "陀螺", "+Z（Yaw），15 deg/s", "沿实测夹具 Z 对应的 Tool Rz 正向扫转；仅中间 ±75° 匀速平台记录", "实际速度稳定；无夹具滑动", 2, 1, 10, 2, 0x24, MCAL_CAPTURE_GYRO_M, "11 路 Gyro/Acc 原始值、实际角速度、配置轴相对角度", "加速/减速/回中位未进入采集窗口"),
     QuickCalStep("G06", "陀螺", "-Z（Yaw），15 deg/s", "沿 G05 同一 Tool Rz 反向扫转；仅中间 ±75° 匀速平台记录", "实际速度稳定；无夹具滑动", 2, 1, 10, 2, 0x25, MCAL_CAPTURE_GYRO_M, "11 路 Gyro/Acc 原始值、实际角速度、配置轴相对角度", "加速/减速/回中位未进入采集窗口"),
-    QuickCalStep("S01", "提交", "求解并写入", "机械臂安全静止；禁止断电拔线", "P1、A01-A06、G01-G06 共 13 个正式阶段全部完成", 0, 0, 0, 60, None, 0, "type=7 v3 报告、写入 ACK", "11 路 Gyro/Acc 和 Flash 回读通过", False),
-    QuickCalStep("S02", "收尾", "回安全位与归档", "机械臂回安全位，可安全拆卸", "上位机已有最终结果", 15, 0, 0, 0, None, 0, "CSV、session.json、result.json", "记录完整且可追溯", False),
+    QuickCalStep("M01", "磁标定", "Roll/Pitch 三维覆盖", "Tool Rz 对应 Roll、Tool Ry 对应 Pitch；两轴均 ±75° 连续覆盖并回中位", "从标定中位开始；磁环境和线束已确认", 0, 0, 40, 0, 0x30, MCAL_CAPTURE_MAG, "掌部磁传感器原始场", "40 秒内 Roll/Pitch 正反向覆盖充分"),
+    QuickCalStep("M02", "磁标定", "Yaw 正向单侧往返", "Tool Rx 从 0° 到 +45° 后沿原路径回到 0°", "从标定中位开始；路径无碰撞", 0, 0, 10, 0, 0x31, MCAL_CAPTURE_MAG, "掌部磁传感器原始场", "10 秒内完成正向单侧往返并回中位"),
+    QuickCalStep("M03", "磁标定", "Yaw 负向单侧往返", "Tool Rx 从 0° 到 -45° 后沿原路径回到 0°", "从标定中位开始；路径无碰撞", 0, 0, 10, 0, 0x32, MCAL_CAPTURE_MAG, "掌部磁传感器原始场", "10 秒内完成负向单侧往返并回中位"),
+    QuickCalStep("M04", "磁标定", "中位静止收尾", "回到 Tool Rz=0° 标定中位并静止保持 5 秒", "机械臂静止；线束无受力", 0, 0, 0, 5, 0x33, MCAL_CAPTURE_MAG, "仅记录阶段标记，不采集磁数据", "中位静止 5 秒且未向磁解算器送样"),
+    QuickCalStep("S01", "提交", "求解并写入", "机械臂安全静止；禁止断电拔线", "P1、A01-A06、G01-G06、M01-M04 共 17 个正式阶段全部完成", 0, 0, 0, 60, None, 0, "type=7 v4 Gyro/Accel/Mag 报告、写入 ACK", "Gyro/Accel/Mag 和 Flash 写入全部通过", False),
+    QuickCalStep("S02", "收尾", "回标定中位与归档", "机械臂回示教标定中位并保持静止", "上位机已有最终结果", 15, 0, 0, 0, None, 0, "CSV、session.json、result.json", "记录完整且机械臂已到标定中位", False),
 )
 
 

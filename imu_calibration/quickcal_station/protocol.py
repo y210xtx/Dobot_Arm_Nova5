@@ -38,10 +38,10 @@ ALL_IMU_MASK = 0x07FF
 MAX_PAYLOAD_LENGTH = 4096
 EXPECTED_VERSION_PAYLOAD_VERSION = 1
 EXPECTED_FIRMWARE_REVISION = 24
-EXPECTED_FIRMWARE_TAG = "r024-fac-rawq"
-EXPECTED_MCAL_REPORT_VERSION = 3
-EXPECTED_MCAL_PAYLOAD_LENGTH = 1046
-EXPECTED_GYRO_SEGMENTS = 40
+EXPECTED_FIRMWARE_TAG = "r024-fac-magq"
+EXPECTED_MCAL_REPORT_VERSION = 4
+EXPECTED_MCAL_PAYLOAD_LENGTH = 1110
+EXPECTED_GYRO_SEGMENTS = 32
 
 GYRO_REJECT_INSUFFICIENT = 0x01
 GYRO_REJECT_SOLVER = 0x02
@@ -152,6 +152,11 @@ class VersionFrame:
         return bool(self.features & 0x80)
 
     @property
+    def magnetic_factory(self) -> bool:
+        """Firmware requires M01..M04 and appends magnetic quality to type=7."""
+        return bool(self.features & 0x10)
+
+    @property
     def r024_compatible(self) -> bool:
         return (
             self.payload_version == EXPECTED_VERSION_PAYLOAD_VERSION
@@ -160,6 +165,7 @@ class VersionFrame:
             and self.factory_intrinsic
             and self.accel_intrinsic
             and self.factory_raw_streams
+            and self.magnetic_factory
         )
 
 
@@ -192,6 +198,39 @@ class AccelQuality:
 
 
 @dataclass(frozen=True)
+class MagSlotQuality:
+    sample_count: int
+    span_x: int
+    span_y: int
+    span_z: int
+    offset_x: int
+    offset_y: int
+    offset_z: int
+    scale_x1000: int
+    scale_y1000: int
+    scale_z1000: int
+
+
+@dataclass(frozen=True)
+class MagQuality:
+    ok: bool
+    reject_flags: int
+    seen_mask: int
+    slot_count: int
+    slots: tuple[MagSlotQuality, ...]
+
+    @property
+    def reject_reasons(self) -> tuple[str, ...]:
+        labels = (
+            (0x01, "MMC5983MA 未采到数据"),
+            (0x02, "MMC5983MA X 轴覆盖不足"),
+            (0x04, "MMC5983MA Y 轴覆盖不足"),
+            (0x08, "MMC5983MA Z 轴覆盖不足"),
+        )
+        return tuple(label for mask, label in labels if self.reject_flags & mask)
+
+
+@dataclass(frozen=True)
 class McalReportFrame:
     seq: int
     context: int
@@ -207,6 +246,7 @@ class McalReportFrame:
     accel_quality: tuple[AccelQuality, ...]
     gyro_matrices: tuple[tuple[float, ...], ...]
     accel_matrices: tuple[tuple[float, ...], ...]
+    mag_quality: MagQuality
     payload: bytes = field(repr=False)
 
     @property
@@ -249,7 +289,18 @@ class McalReportFrame:
 
     @property
     def factory_pass(self) -> bool:
-        return self.gyro_all_ok and self.accel_all_ok
+        return self.gyro_all_ok and self.accel_all_ok and self.mag_all_ok
+
+    @property
+    def mag_all_ok(self) -> bool:
+        return (
+            self.format_valid
+            and self.status == 0
+            and bool(self.flags & 0x04)
+            and self.mag_quality.ok
+            and self.mag_quality.reject_flags == 0
+            and bool(self.mag_quality.seen_mask & 0x01)
+        )
 
 
 @dataclass
@@ -496,6 +547,31 @@ class ProtocolParser:
                         struct.unpack_from("<h", payload, offset + 12)[0],
                     )
                 )
+        mag_offset = accel_quality_offset + 11 * 14 + 11 * 36
+        mag_slots: list[MagSlotQuality] = []
+        for index in range(3):
+            offset = mag_offset + 4 + index * 20
+            mag_slots.append(
+                MagSlotQuality(
+                    sample_count=struct.unpack_from("<H", payload, offset)[0],
+                    span_x=struct.unpack_from("<H", payload, offset + 2)[0],
+                    span_y=struct.unpack_from("<H", payload, offset + 4)[0],
+                    span_z=struct.unpack_from("<H", payload, offset + 6)[0],
+                    offset_x=struct.unpack_from("<h", payload, offset + 8)[0],
+                    offset_y=struct.unpack_from("<h", payload, offset + 10)[0],
+                    offset_z=struct.unpack_from("<h", payload, offset + 12)[0],
+                    scale_x1000=struct.unpack_from("<H", payload, offset + 14)[0],
+                    scale_y1000=struct.unpack_from("<H", payload, offset + 16)[0],
+                    scale_z1000=struct.unpack_from("<H", payload, offset + 18)[0],
+                )
+            )
+        mag_quality = MagQuality(
+            ok=bool(payload[mag_offset]),
+            reject_flags=payload[mag_offset + 1],
+            seen_mask=payload[mag_offset + 2],
+            slot_count=payload[mag_offset + 3],
+            slots=tuple(mag_slots),
+        )
         return McalReportFrame(
             seq=seq,
             context=payload[0],
@@ -511,5 +587,6 @@ class ProtocolParser:
             accel_quality=tuple(accel_quality),
             gyro_matrices=self._matrix_block(payload, 12 + 11 * 8, imu_count),
             accel_matrices=self._matrix_block(payload, accel_quality_offset + 11 * 14, imu_count),
+            mag_quality=mag_quality,
             payload=payload,
         )
