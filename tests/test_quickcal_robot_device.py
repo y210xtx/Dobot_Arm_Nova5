@@ -27,6 +27,10 @@ class FakeDashboard:
         self.calls.append(("MovJ", pose, options))
         return "0,{}"
 
+    def PositiveKin(self, *joints, **options):
+        self.calls.append(("PositiveKin", joints, options))
+        return "0,{1,2,3,4,5,6}"
+
     def SpeedFactor(self, percent):
         self.calls.append(("SpeedFactor", percent))
         return "0,{}"
@@ -84,6 +88,31 @@ class RobotDeviceTests(unittest.TestCase):
 
         self.assertEqual(dashboard.calls[0][2]["v"], 100)
         self.assertEqual(dashboard.calls[1][2]["v"], 100)
+
+    def test_joint_move_supports_acceleration_and_blending(self):
+        dashboard = FakeDashboard()
+        robot = RobotDevice()
+        robot.dashboard = dashboard
+
+        self.assertTrue(robot.move_joints((0.0,) * 6, 12, 30, 85))
+
+        self.assertEqual(
+            dashboard.calls[0][2], {"a": 30, "v": 12, "cp": 85}
+        )
+
+    def test_positive_kinematics_parses_controller_pose(self):
+        dashboard = FakeDashboard()
+        robot = RobotDevice()
+        robot.dashboard = dashboard
+
+        self.assertEqual(
+            robot.positive_kinematics((0.0,) * 6, 0, 1),
+            (1.0, 2.0, 3.0, 4.0, 5.0, 6.0),
+        )
+        self.assertEqual(
+            dashboard.calls[0],
+            ("PositiveKin", (0.0,) * 6, {"user": 0, "tool": 1}),
+        )
 
     def test_negative_half_turn_keeps_reverse_direction_in_both_segments(self):
         dashboard = FakeDashboard()

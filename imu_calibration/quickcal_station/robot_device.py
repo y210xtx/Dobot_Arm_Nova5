@@ -294,21 +294,58 @@ class RobotDevice(QObject):
             ),
         )
 
-    def move_joints(self, joints: tuple[float, ...], velocity_percent: int = 15) -> bool:
-        if len(joints) != 6:
-            self.error_occurred.emit("目标关节位姿必须包含 J1～J6 六个值")
+    def move_joints(
+        self,
+        joints: tuple[float, ...],
+        velocity_percent: int = 15,
+        acceleration_percent: int = 20,
+        blend_percent: int = 0,
+    ) -> bool:
+        values = tuple(float(value) for value in joints)
+        if len(values) != 6 or not all(math.isfinite(value) for value in values):
+            self.error_occurred.emit("目标关节位姿必须包含 J1～J6 六个有限数值")
             return False
         velocity_percent = max(1, min(100, int(velocity_percent)))
+        acceleration_percent = max(1, min(100, int(acceleration_percent)))
+        blend_percent = max(0, min(100, int(blend_percent)))
         return self._command(
             "机械臂移动到示教关节位",
             lambda: self.dashboard.MovJ(
-                *joints,
+                *values,
                 1,
-                a=20,
+                a=acceleration_percent,
                 v=velocity_percent,
-                cp=0,
+                cp=blend_percent,
             ),
         )
+
+    def positive_kinematics(
+        self, joints: tuple[float, ...], user: int, tool: int
+    ) -> tuple[float, ...] | None:
+        values = tuple(float(value) for value in joints)
+        if (
+            self.dashboard is None
+            or len(values) != 6
+            or not all(math.isfinite(value) for value in values)
+        ):
+            return None
+        try:
+            response = self.dashboard.PositiveKin(
+                *values, user=int(user), tool=int(tool)
+            )
+        except Exception as exc:
+            self.error_occurred.emit(f"机械臂正解失败：{exc}")
+            return None
+        error_id = self.response_error_id(response)
+        match = re.search(r"\{([^{}]+)\}", str(response))
+        if error_id != 0 or match is None:
+            self.error_occurred.emit(f"机械臂正解被控制器拒绝：{response}")
+            return None
+        try:
+            pose = tuple(float(value) for value in match.group(1).split(","))
+        except ValueError:
+            return None
+        return pose if len(pose) == 6 else None
 
     def relative_tool_rotation(
         self,

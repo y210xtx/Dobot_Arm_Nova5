@@ -151,6 +151,55 @@ class CoordinatorCompatibilityTests(unittest.TestCase):
         self.assertEqual(coordinator.step_status[1], "失败")
         coordinator.tick_timer.stop()
 
+    def test_capture_audit_does_not_treat_pre_open_raw_frame_as_new_stage(self):
+        glove = FakeGlove()
+        robot = FakeRobot()
+        coordinator = QuickCalCoordinator(glove, robot)
+        coordinator.current_index = next(
+            index for index, step in enumerate(coordinator.steps)
+            if step.step_id == "M01"
+        )
+        coordinator.state = RunState.CAPTURING
+        self._prime_raw_streams(coordinator, stage_id=0, capture_mask=0)
+        now = time.monotonic_ns()
+        coordinator.capture_started_ns = now - coordinator.RAW_STAGE_SYNC_NS - 10_000_000
+        coordinator.raw_imu_ns = coordinator.capture_started_ns - 1
+        coordinator.register_imu_ns = coordinator.capture_started_ns - 1
+
+        self.assertIn(
+            "阶段开启后尚未收到新的 type=9",
+            coordinator._raw_capture_health_error(now),
+        )
+
+        step = coordinator.current_step
+        self._prime_raw_streams(
+            coordinator, stage_id=step.stage_code, capture_mask=step.capture_mask
+        )
+        self.assertEqual(coordinator._raw_capture_health_error(time.monotonic_ns()), "")
+        coordinator.tick_timer.stop()
+
+    def test_capture_audit_waits_for_matching_stage_frames_before_timeout(self):
+        coordinator = QuickCalCoordinator(FakeGlove(), FakeRobot())
+        coordinator.current_index = next(
+            index for index, step in enumerate(coordinator.steps)
+            if step.step_id == "M01"
+        )
+        coordinator.state = RunState.CAPTURING
+        now = time.monotonic_ns()
+        coordinator.capture_started_ns = now - 500_000_000
+        self._prime_raw_streams(coordinator, stage_id=0, capture_mask=0)
+
+        self.assertEqual(coordinator._raw_capture_health_error(now), "")
+
+        after_timeout = (
+            coordinator.capture_started_ns + coordinator.RAW_STAGE_SYNC_NS + 1
+        )
+        self.assertIn(
+            "板端阶段审计不一致",
+            coordinator._raw_capture_health_error(after_timeout),
+        )
+        coordinator.tick_timer.stop()
+
     def test_p1_starts_automatically_after_two_seconds_of_robot_stillness(self):
         glove = FakeGlove()
         robot = FakeRobot()
@@ -605,7 +654,7 @@ class CoordinatorCompatibilityTests(unittest.TestCase):
         self.assertEqual(coordinator._motion_coverage_error("M01"), "")
         coordinator.motion_coverage["y_negative"] = False
         self.assertIn("J6", coordinator._motion_coverage_error("M01"))
-        self.assertIn("Tool Ry", coordinator._motion_coverage_error("M01"))
+        self.assertIn("J2/J3/J4", coordinator._motion_coverage_error("M01"))
 
         coordinator._reset_motion_coverage()
         coordinator.motion_coverage["x_positive"] = True
@@ -615,6 +664,33 @@ class CoordinatorCompatibilityTests(unittest.TestCase):
         coordinator.motion_coverage["x_negative"] = False
         self.assertIn("Tool Rx", coordinator._motion_coverage_error("M02"))
         self.assertEqual(coordinator._motion_coverage_error("M04"), "")
+        coordinator.tick_timer.stop()
+
+    def test_m02_m03_allow_final_braking_after_both_rx_directions_are_covered(self):
+        coordinator = QuickCalCoordinator(FakeGlove(), FakeRobot())
+        coordinator.current_index = next(
+            index
+            for index, step in enumerate(coordinator.steps)
+            if step.step_id == "M02"
+        )
+        coordinator._reset_motion_coverage()
+        stopped = SimpleNamespace(
+            pose=(0.0,) * 6,
+            angular_speed=(0.0,) * 3,
+        )
+
+        self.assertIn("慢速往返", coordinator._mag_motion_error(stopped))
+        coordinator.motion_coverage["x_positive"] = True
+        self.assertIn("慢速往返", coordinator._mag_motion_error(stopped))
+        coordinator.motion_coverage["x_negative"] = True
+        self.assertEqual(coordinator._mag_motion_error(stopped), "")
+
+        coordinator.current_index = next(
+            index
+            for index, step in enumerate(coordinator.steps)
+            if step.step_id == "M03"
+        )
+        self.assertEqual(coordinator._mag_motion_error(stopped), "")
         coordinator.tick_timer.stop()
 
 

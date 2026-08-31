@@ -98,6 +98,20 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(len(report.gyro_matrices), 11)
         self.assertEqual(len(report.accel_matrices), 11)
 
+    def test_failed_gyro_does_not_relabel_passing_accel_or_mag_quality(self):
+        payload = bytearray(self.valid_mcal_payload())
+        payload[3] = 10
+        payload[6] = 11
+        payload[12] = 0
+        payload[13] = 0x08
+
+        report = ProtocolParser()._parse_mcal(7, bytes(payload))
+
+        self.assertFalse(report.gyro_all_ok)
+        self.assertTrue(report.accel_all_ok)
+        self.assertTrue(report.mag_all_ok)
+        self.assertFalse(report.factory_pass)
+
     def test_type7_rejects_truncated_or_wrong_version_report(self):
         parser = ProtocolParser()
         with self.assertRaises(ValueError):

@@ -56,7 +56,12 @@ class QuickCalCoordinator(QObject):
     ACK_TIMEOUT_NS = 1_000_000_000
     COMMIT_TIMEOUT_NS = 2_000_000_000
     REPORT_TIMEOUT_NS = 10_000_000_000
-    RAW_STAGE_SYNC_NS = 300_000_000
+    # Stage-open ACKs and raw frames arrive through different Qt signal queues.
+    # M01 also pumps the event loop while queueing 80 MovJ targets, so a timer
+    # callback can overtake the first raw frame for the new stage.  Wait for a
+    # matching type=9/type=11 pair before treating the last idle-stage frame as
+    # a fault; a real stream/stage mismatch still fails after this timeout.
+    RAW_STAGE_SYNC_NS = 2_000_000_000
     DYNAMIC_DEVIATION_GRACE_NS = 300_000_000
     ROBOT_MODE_IDLE = 5
     ROBOT_DYNAMIC_MODES = (7, 8)
@@ -316,22 +321,29 @@ class QuickCalCoordinator(QObject):
         return ""
 
     def _raw_capture_health_error(self, now: int) -> str:
-        error = self._raw_health_error(now)
-        if error:
-            return f"采集期间{error}"
-        if now - self.capture_started_ns <= self.RAW_STAGE_SYNC_NS:
-            return ""
         step = self.current_step
-        for frame_type, frame in (
-            (9, self.latest_raw_imu),
-            (11, self.latest_register_imu),
+        pending_error = ""
+        for frame_type, frame, received_ns in (
+            (9, self.latest_raw_imu, self.raw_imu_ns),
+            (11, self.latest_register_imu, self.register_imu_ns),
         ):
+            if received_ns <= self.capture_started_ns:
+                pending_error = f"阶段开启后尚未收到新的 type={frame_type} 原始帧"
+                break
             if frame.stage_id != step.stage_code or frame.capture_mask != step.capture_mask:
-                return (
+                pending_error = (
                     f"type={frame_type} 板端阶段审计不一致："
                     f"stage=0x{frame.stage_id:02X}, mask=0x{frame.capture_mask:02X}；"
                     f"期望 stage=0x{step.stage_code:02X}, mask=0x{step.capture_mask:02X}"
                 )
+                break
+        if pending_error:
+            if now - self.capture_started_ns <= self.RAW_STAGE_SYNC_NS:
+                return ""
+            return pending_error
+        error = self._raw_health_error(now)
+        if error:
+            return f"采集期间{error}"
         return ""
 
     @Slot()
@@ -719,8 +731,8 @@ class QuickCalCoordinator(QObject):
             missing = [name for name in required if not self.motion_coverage[name]]
             if missing:
                 return (
-                    "M01 J6/Pitch 覆盖不足：J6 叠加产生的 Tool Rz 与基础 "
-                    "Tool Ry 必须均包含正、反向运动"
+                    "M01 四轴叠加覆盖不足：J2/J3/J4 俯仰与 J6 往复 "
+                    "必须均包含正、反向运动"
                 )
             return ""
         if not (
@@ -767,6 +779,15 @@ class QuickCalCoordinator(QObject):
             ):
                 return "M01 要求机械臂保持固定 XYZ 的 Tool Ry 与 J6 方向连续慢速往复"
         elif step_id in ("M02", "M03"):
+            # The window motion is coverage-based, not a requirement to keep
+            # jogging until the final millisecond.  Once both Rx directions
+            # have been observed, the station may brake before neutral and
+            # remain still while the fixed ten-second capture window closes.
+            if (
+                self.motion_coverage["x_positive"]
+                and self.motion_coverage["x_negative"]
+            ):
+                return ""
             if abs(tool_speed[0]) < self.MAG_COVERAGE_SPEED_DEG_S:
                 return f"{step_id} 要求机械臂保持 Tool Rx 慢速往返"
         return ""

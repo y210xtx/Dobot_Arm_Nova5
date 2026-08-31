@@ -262,7 +262,6 @@ class McalReportFrame:
     def gyro_all_ok(self) -> bool:
         return (
             self.format_valid
-            and self.status == 0
             and self.calibrated_count == 11
             and bool(self.flags & 0x01)
             and len(self.gyro_quality) == 11
@@ -279,8 +278,6 @@ class McalReportFrame:
     def accel_all_ok(self) -> bool:
         return (
             self.format_valid
-            and self.status == 0
-            and self.calibrated_count == 11
             and bool(self.flags & 0x02)
             and len(self.accel_quality) == 11
             and len(self.accel_matrices) == 11
@@ -289,13 +286,18 @@ class McalReportFrame:
 
     @property
     def factory_pass(self) -> bool:
-        return self.gyro_all_ok and self.accel_all_ok and self.mag_all_ok
+        return (
+            self.format_valid
+            and self.status == 0
+            and self.gyro_all_ok
+            and self.accel_all_ok
+            and self.mag_all_ok
+        )
 
     @property
     def mag_all_ok(self) -> bool:
         return (
             self.format_valid
-            and self.status == 0
             and bool(self.flags & 0x04)
             and self.mag_quality.ok
             and self.mag_quality.reject_flags == 0

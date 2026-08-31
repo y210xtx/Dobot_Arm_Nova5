@@ -1,4 +1,5 @@
 import os
+import math
 import time
 from types import SimpleNamespace
 import unittest
@@ -18,10 +19,16 @@ try:
         MAG_M01_J6_SAFE_DEG,
         MAG_M01_POSE_WAYPOINTS,
         MAG_M01_SEGMENT_S,
+        MAG_M01_SUBSEGMENTS_PER_LEG,
+        MAG_M01_TURN_BLEND_PERCENT,
+        MAG_M01_VELOCITY_PERCENT,
         MAG_M01_XYZ_TOLERANCE_MM,
         MAG_M04_MOTION_GRACE_S,
         MAG_M04_STOP_SETTLE_S,
         MAG_TRAJECTORIES,
+        MAG_YAW_STOP_LEAD_DEG,
+        MAG_YAW_TURN_SETTLE_S,
+        NEUTRAL_RETURN_SPEED_PERCENT,
         QuickCalWindow,
     )
 except ModuleNotFoundError as exc:
@@ -30,8 +37,12 @@ except ModuleNotFoundError as exc:
     QuickCalCoordinator = QuickCalWindow = RobotState = RunState = None
     MAG_AUTO_STEPS = MAG_M01_BLEND_PERCENT = MAG_M01_J6_SAFE_DEG = None
     MAG_M01_POSE_WAYPOINTS = MAG_TRAJECTORIES = None
-    MAG_M01_SEGMENT_S = MAG_M01_XYZ_TOLERANCE_MM = None
+    MAG_M01_SEGMENT_S = MAG_M01_SUBSEGMENTS_PER_LEG = None
+    MAG_M01_TURN_BLEND_PERCENT = MAG_M01_XYZ_TOLERANCE_MM = None
+    MAG_M01_VELOCITY_PERCENT = None
     MAG_M04_MOTION_GRACE_S = MAG_M04_STOP_SETTLE_S = None
+    MAG_YAW_STOP_LEAD_DEG = MAG_YAW_TURN_SETTLE_S = None
+    NEUTRAL_RETURN_SPEED_PERCENT = None
 
 
 class ManualMotionHarness:
@@ -103,6 +114,7 @@ class MagneticMotionHarness:
     if QuickCalWindow is not None:
         _relative_tool_axis_deg = QuickCalWindow._relative_tool_axis_deg
         _matmul3 = staticmethod(QuickCalWindow._matmul3)
+        _m01_pose_samples = staticmethod(QuickCalWindow._m01_pose_samples)
         _m01_fixed_frame_angles = QuickCalWindow._m01_fixed_frame_angles
         _mag_limit_error = QuickCalWindow._mag_limit_error
 
@@ -113,6 +125,71 @@ class MagneticMotionHarness:
         )
         self._mag_reference_pose = (0.0,) * 6
         self._mag_reference_joints = (0.0,) * 6
+
+
+class MagYawMotionHarness:
+    if QuickCalWindow is not None:
+        _update_mag_auto_action = QuickCalWindow._update_mag_auto_action
+        _start_mag_segment = QuickCalWindow._start_mag_segment
+        _relative_tool_axis_deg = QuickCalWindow._relative_tool_axis_deg
+
+    def __init__(self, step_id="M02"):
+        self._auto_action_step = step_id
+        self._mag_phase = "capturing"
+        self._mag_phase_started_ns = 0
+        self._mag_segment_index = 0
+        self._mag_pending_segment_index = -1
+        self._mag_reference_pose = (0.0,) * 6
+        self._auto_action_stable_since_ns = 0
+        self._mag_jog_active = True
+        self._mag_speed_factor = 22
+        self._mag_speed_source = "test"
+        self.logs = []
+        self.fail_message = ""
+        self.robot = SimpleNamespace(stops=0, switches=[])
+        self.robot.stop_tool_jog = self._stop_tool_jog
+        self.robot.switch_tool_jog = self._switch_tool_jog
+        self.coordinator = SimpleNamespace(
+            state=RunState.CAPTURING,
+            capture_started_ns=0,
+            _tool_axes=QuickCalCoordinator._tool_axes,
+            recorder=SimpleNamespace(marker=lambda *_args: None),
+        )
+
+    def _stop_tool_jog(self):
+        self.robot.stops += 1
+        return True
+
+    def _switch_tool_jog(self, axis, positive, user, tool):
+        self.robot.switches.append((axis, positive, user, tool))
+        return True
+
+    def _check_auto_action_timeout(self, _now):
+        pass
+
+    def _mag_limit_error(self, _step_id, _state):
+        return ""
+
+    def _fail_mag_auto_action(self, message):
+        self.fail_message = message
+
+    def _append_log(self, message, level="info"):
+        self.logs.append((message, level))
+
+    def update_at(self, seconds, rx_deg, *, mode=5, angular=0.0):
+        state = SimpleNamespace(
+            mode=mode,
+            linear_speed_norm=0.0,
+            angular_speed_norm=angular,
+            pose=(0.0, 0.0, 0.0, rx_deg, 0.0, 0.0),
+            user=0,
+            tool=1,
+        )
+        with patch(
+            "imu_calibration.quickcal_station.window.time.monotonic_ns",
+            return_value=int(seconds * 1_000_000_000),
+        ):
+            self._update_mag_auto_action(state)
 
 
 class FakeM01Robot:
@@ -146,28 +223,75 @@ class FakeM01Robot:
         )
         return True
 
+    def move_joints(
+        self,
+        target,
+        velocity_percent,
+        acceleration_percent,
+        blend_percent,
+    ):
+        self.moves.append(
+            (
+                target,
+                velocity_percent,
+                acceleration_percent,
+                blend_percent,
+            )
+        )
+        return True
+
 
 class M01TrajectoryHarness:
     if QuickCalWindow is not None:
         _matmul3 = staticmethod(QuickCalWindow._matmul3)
+        _continuous_euler_xyz = staticmethod(QuickCalWindow._continuous_euler_xyz)
+        _m01_pose_samples = staticmethod(QuickCalWindow._m01_pose_samples)
         _m01_absolute_targets = QuickCalWindow._m01_absolute_targets
         _m01_fixed_frame_angles = QuickCalWindow._m01_fixed_frame_angles
         _orientation_error_deg = QuickCalWindow._orientation_error_deg
+        _m01_post_solve_state_error = QuickCalWindow._m01_post_solve_state_error
         _start_m01_combined_trajectory = QuickCalWindow._start_m01_combined_trajectory
+        _cancel_m01_queue = QuickCalWindow._cancel_m01_queue
+        _queue_next_m01_target = QuickCalWindow._queue_next_m01_target
 
     def __init__(self):
         self.reference_joints = (-6.0, -8.0, -114.0, -58.0, -96.0, 40.0)
         self._mag_reference_pose = (0.0,) * 6
         self._mag_reference_joints = self.reference_joints
+        samples = self._m01_pose_samples()
+        targets = []
+        for pitch, roll, leg, subsegment in samples:
+            joints = list(self.reference_joints)
+            joints[1] += pitch * 0.2
+            joints[2] -= pitch * 0.3
+            joints[3] += pitch * 0.1
+            joints[5] += roll
+            targets.append(
+                SimpleNamespace(
+                    joints=tuple(joints),
+                    pitch_deg=pitch,
+                    roll_deg=roll,
+                    leg_index=leg,
+                    subsegment_index=subsegment,
+                    position_error_mm=0.01,
+                    orientation_error_deg=0.02,
+                )
+            )
+        self._mag_m01_joint_trajectory = SimpleNamespace(targets=tuple(targets))
+        self._mag_m01_queue_index = 0
+        self._mag_m01_queue_token = 0
         self._mag_speed_factor = 0
         self._mag_speed_source = ""
         self._auto_action_seen_motion = False
+        self._auto_action_step = "M01"
+        self._mag_phase = "combined_capturing"
         self.fail_message = ""
         self.logs = []
         self.robot = FakeM01Robot()
         self.coordinator = SimpleNamespace(
             _tool_axes=QuickCalCoordinator._tool_axes,
             recorder=SimpleNamespace(marker=lambda *_args: None),
+            state=RunState.CAPTURING,
         )
 
     def _fail_mag_auto_action(self, message):
@@ -175,6 +299,92 @@ class M01TrajectoryHarness:
 
     def _append_log(self, message, level="info"):
         self.logs.append((message, level))
+
+
+class M01CaptureHarness:
+    if QuickCalWindow is not None:
+        _update_mag_auto_action = QuickCalWindow._update_mag_auto_action
+        _m01_at_final_reference = QuickCalWindow._m01_at_final_reference
+        _orientation_error_deg = QuickCalWindow._orientation_error_deg
+        _angle_distance_deg = staticmethod(QuickCalWindow._angle_distance_deg)
+        _at_taught_pose = QuickCalWindow._at_taught_pose
+
+    def __init__(self, phase="combined_capturing"):
+        self._auto_action_step = "M01"
+        self._mag_phase = phase
+        self._mag_phase_started_ns = 0
+        self._mag_reference_pose = (500.0, -170.0, 344.0, 0.0, 0.0, 0.0)
+        self._mag_reference_joints = (-6.0, -8.0, -114.0, -58.0, -96.0, 45.0)
+        self._auto_action_seen_motion = True
+        self._mag_m01_idle_since_ns = 0
+        self._mag_m01_completed_motion = False
+        self.logs = []
+        self.fail_message = ""
+        neutral = SimpleNamespace(
+            pose=self._mag_reference_pose,
+            joints=self._mag_reference_joints,
+            user=0,
+            tool=1,
+        )
+        self.taught_poses = {"neutral": neutral}
+        self.robot = SimpleNamespace(
+            latest_state=None,
+            moves=[],
+            activated=[],
+        )
+        self.robot.activate_frames = lambda user, tool: (
+            self.robot.activated.append((user, tool)) or True
+        )
+        self.robot.move_joints = lambda joints, velocity: (
+            self.robot.moves.append(("joints", joints, velocity)) or True
+        )
+        self.robot.move_pose_j = lambda pose, velocity, user, tool: (
+            self.robot.moves.append(("pose", pose, velocity, user, tool)) or True
+        )
+        m01_step = SimpleNamespace(step_id="M01", capture_s=40.0)
+        self.coordinator = SimpleNamespace(
+            state=RunState.CAPTURING if phase == "combined_capturing" else RunState.READY,
+            capture_started_ns=0,
+            current_step=(
+                m01_step if phase == "combined_capturing" else SimpleNamespace(step_id="M02")
+            ),
+            steps=(m01_step,),
+            _tool_axes=QuickCalCoordinator._tool_axes,
+        )
+
+    def _check_auto_action_timeout(self, _now):
+        pass
+
+    def _mag_limit_error(self, _step_id, _state):
+        return ""
+
+    def _restore_mag_speed_factor(self):
+        pass
+
+    def _fail_mag_auto_action(self, message):
+        self.fail_message = message
+
+    def _append_log(self, message, level="info"):
+        self.logs.append((message, level))
+
+    def state(self, *, final=True):
+        return SimpleNamespace(
+            mode=5,
+            linear_speed_norm=0.0,
+            angular_speed_norm=0.0,
+            pose=(
+                self._mag_reference_pose
+                if final
+                else (500.0, -170.0, 344.0, 0.0, 20.0, 0.0)
+            ),
+            joints=(
+                self._mag_reference_joints
+                if final
+                else (-6.0, -20.0, -100.0, -70.0, -96.0, 30.0)
+            ),
+            user=0,
+            tool=1,
+        )
 
 
 class M04MotionHarness:
@@ -233,6 +443,7 @@ class FullAutoHarness:
 
     def __init__(self, step_id):
         self._full_auto_enabled = True
+        self._full_auto_next_start_not_before_ns = 0
         self._auto_action_step = None
         self.robot_actions = {"A01": object()}
         self.config = SimpleNamespace(enabled=True)
@@ -443,56 +654,182 @@ class GyroMotionParameterTests(unittest.TestCase):
             (("Rx", False, 5.0), ("Rx", True, 5.0)),
         )
         self.assertEqual(MAG_TRAJECTORIES["M04"], ())
+        self.assertEqual(MAG_YAW_STOP_LEAD_DEG, 7.0)
+        self.assertEqual(MAG_YAW_TURN_SETTLE_S, 0.5)
 
-    def test_m01_queues_fixed_xyz_composite_ry_j6_direction_poses(self):
+    def test_m02_brakes_early_waits_for_continuous_idle_then_reverses(self):
+        harness = MagYawMotionHarness("M02")
+
+        harness.update_at(4.2, 38.0, mode=8, angular=9.0)
+        self.assertEqual(harness.robot.stops, 1)
+        self.assertEqual(harness._mag_phase, "wait_segment_stop")
+        self.assertEqual(harness._mag_pending_segment_index, 1)
+
+        harness.update_at(5.0, 44.7)
+        harness.update_at(5.49, 44.7)
+        self.assertEqual(harness.robot.switches, [])
+        harness.update_at(5.5, 44.7)
+
+        self.assertEqual(harness._mag_phase, "capturing")
+        self.assertEqual(harness._mag_segment_index, 1)
+        self.assertEqual(harness.robot.switches, [("Rx", False, 0, 1)])
+        self.assertEqual(harness.fail_message, "")
+
+    def test_m03_return_leg_brakes_before_crossing_neutral(self):
+        harness = MagYawMotionHarness("M03")
+        harness._mag_segment_index = 1
+
+        harness.update_at(9.4, -7.0, mode=8, angular=9.0)
+
+        self.assertEqual(harness.robot.stops, 1)
+        self.assertEqual(harness._mag_phase, "capture_final_stop")
+        self.assertEqual(harness.fail_message, "")
+
+    def test_m01_queues_constrained_j234_and_j6_overlay(self):
         harness = M01TrajectoryHarness()
         state = SimpleNamespace(user=0, tool=1)
+        callbacks = []
 
-        self.assertTrue(harness._start_m01_combined_trajectory(state))
+        with patch(
+            "imu_calibration.quickcal_station.window.QTimer.singleShot",
+            side_effect=lambda _delay, callback: callbacks.append(callback),
+        ):
+            self.assertTrue(harness._start_m01_combined_trajectory(state))
+            self.assertEqual(harness.robot.moves, [])
+            while callbacks:
+                callbacks.pop(0)()
 
         self.assertEqual(harness.fail_message, "")
         self.assertEqual(harness.robot.speed_factors, [100])
-        self.assertEqual(len(harness.robot.moves), 8)
+        expected_count = (
+            len(MAG_M01_POSE_WAYPOINTS) - 1
+        ) * MAG_M01_SUBSEGMENTS_PER_LEG
+        self.assertEqual(len(harness.robot.moves), expected_count)
         self.assertEqual(
-            [move[5] for move in harness.robot.moves],
-            [MAG_M01_BLEND_PERCENT] * 7 + [0],
+            [move[3] for move in harness.robot.moves],
+            [MAG_M01_BLEND_PERCENT] * (expected_count - 1) + [0],
         )
         self.assertTrue(
-            all(move[0][:3] == harness._mag_reference_pose[:3] for move in harness.robot.moves)
-        )
-        self.assertTrue(all(move[2:4] == (0, 1) for move in harness.robot.moves))
-        for move, (expected_pitch, expected_roll) in zip(
-            harness.robot.moves, MAG_M01_POSE_WAYPOINTS[1:]
-        ):
-            actual_roll, actual_pitch = harness._m01_fixed_frame_angles(
-                harness._mag_reference_pose, move[0]
+            all(
+                move[1:3] == (MAG_M01_VELOCITY_PERCENT, 20)
+                for move in harness.robot.moves
             )
-            self.assertAlmostEqual(actual_pitch, expected_pitch)
-            self.assertAlmostEqual(actual_roll, expected_roll)
-        self.assertEqual(harness.robot.moves[-1][0], harness._mag_reference_pose)
-
-    def test_m01_real_failure_entry_pose_keeps_xyz_and_composes_roll_before_ik(self):
-        harness = M01TrajectoryHarness()
-        harness._mag_reference_pose = (
-            505.841522,
-            -170.047394,
-            343.942047,
-            -10.870000,
-            -89.923600,
-            -169.125000,
         )
-
-        targets = harness._m01_absolute_targets(harness._mag_reference_pose)
-
-        self.assertEqual(len(targets), 8)
         self.assertTrue(
-            all(target[:3] == harness._mag_reference_pose[:3] for target in targets)
+            all(
+                move[0][0] == harness.reference_joints[0]
+                and move[0][4] == harness.reference_joints[4]
+                for move in harness.robot.moves
+            )
         )
-        first_roll, first_pitch = harness._m01_fixed_frame_angles(
-            harness._mag_reference_pose, targets[0]
+        self.assertTrue(
+            any(
+                abs(target.pitch_deg) > 1.0 and abs(target.roll_deg) > 1.0
+                for target in harness._mag_m01_joint_trajectory.targets
+            )
         )
-        self.assertAlmostEqual(first_pitch, MAG_M01_POSE_WAYPOINTS[1][0])
-        self.assertAlmostEqual(first_roll, MAG_M01_POSE_WAYPOINTS[1][1])
+        self.assertEqual(harness.robot.moves[-1][0], harness.reference_joints)
+
+    def test_m01_cancel_prevents_scheduled_batches_from_sending_more_targets(self):
+        harness = M01TrajectoryHarness()
+        callbacks = []
+
+        with patch(
+            "imu_calibration.quickcal_station.window.QTimer.singleShot",
+            side_effect=lambda _delay, callback: callbacks.append(callback),
+        ):
+            self.assertTrue(
+                harness._start_m01_combined_trajectory(
+                    SimpleNamespace(user=0, tool=1)
+                )
+            )
+            callbacks.pop(0)()
+            queued_before_cancel = len(harness.robot.moves)
+            harness._cancel_m01_queue()
+            while callbacks:
+                callbacks.pop(0)()
+
+        self.assertEqual(queued_before_cancel, 4)
+        self.assertEqual(len(harness.robot.moves), queued_before_cancel)
+
+    def test_m01_post_solve_recheck_requires_fresh_unchanged_neutral(self):
+        harness = M01TrajectoryHarness()
+        now = 20_000_000_000
+        reference = SimpleNamespace(
+            received_monotonic_ns=now - 100_000_000,
+            mode=5,
+            linear_speed_norm=0.0,
+            angular_speed_norm=0.0,
+            user=0,
+            tool=1,
+            joints=harness.reference_joints,
+            pose=(500.0, -170.0, 344.0, -180.0, -15.0, 0.0),
+        )
+        current = SimpleNamespace(**vars(reference))
+        with patch(
+            "imu_calibration.quickcal_station.window.time.monotonic_ns",
+            return_value=now,
+        ):
+            self.assertEqual(
+                harness._m01_post_solve_state_error(reference, current), ""
+            )
+            current.received_monotonic_ns = now - 1_100_000_000
+            self.assertIn(
+                "反馈已超时",
+                harness._m01_post_solve_state_error(reference, current),
+            )
+            current.received_monotonic_ns = now - 100_000_000
+            current.joints = (
+                reference.joints[0],
+                reference.joints[1] + 0.3,
+                *reference.joints[2:],
+            )
+            self.assertIn(
+                "中位发生变化",
+                harness._m01_post_solve_state_error(reference, current),
+            )
+
+    def test_m01_accepts_a_completed_trajectory_at_capture_end(self):
+        harness = M01CaptureHarness()
+        with patch(
+            "imu_calibration.quickcal_station.window.time.monotonic_ns",
+            return_value=40_000_000_000,
+        ):
+            harness._update_mag_auto_action(harness.state())
+        with patch(
+            "imu_calibration.quickcal_station.window.time.monotonic_ns",
+            return_value=40_400_000_000,
+        ):
+            harness._update_mag_auto_action(harness.state())
+
+        self.assertTrue(harness._mag_m01_completed_motion)
+        self.assertEqual(harness.fail_message, "")
+        self.assertTrue(any("完整回到关节中位" in item[0] for item in harness.logs))
+
+    def test_m01_capture_end_commands_separate_joint_return_before_m02(self):
+        harness = M01CaptureHarness(phase="wait_jog_stop")
+        stopped_state = harness.state(final=False)
+        harness.robot.latest_state = stopped_state
+
+        with patch(
+            "imu_calibration.quickcal_station.window.time.monotonic_ns",
+            return_value=40_500_000_000,
+        ):
+            harness._update_mag_auto_action(stopped_state)
+
+        self.assertEqual(harness.fail_message, "")
+        self.assertEqual(harness._mag_phase, "return")
+        self.assertEqual(harness._auto_action_step, "M01")
+        self.assertEqual(
+            harness.robot.moves,
+            [
+                (
+                    "joints",
+                    harness._mag_reference_joints,
+                    NEUTRAL_RETURN_SPEED_PERCENT,
+                )
+            ],
+        )
 
     def test_m04_requires_one_continuous_second_before_hold(self):
         harness = M04MotionHarness()
@@ -594,11 +931,13 @@ class GyroMotionParameterTests(unittest.TestCase):
             ),
             "",
         )
-        self.assertIn(
-            "Tool Rx",
+        # M02/M03 no longer impose an application-side Rx angle limit.  Robot
+        # alarm, collision and controller workspace protections remain active.
+        self.assertEqual(
             harness._mag_limit_error(
-                "M03", SimpleNamespace(pose=(0.0, 0.0, 0.0, -51.0, 0.0, 0.0))
+                "M03", SimpleNamespace(pose=(0.0, 0.0, 0.0, -120.0, 0.0, 0.0))
             ),
+            "",
         )
         self.assertEqual(
             harness._mag_limit_error(
@@ -626,6 +965,32 @@ class GyroMotionParameterTests(unittest.TestCase):
                     for call in harness.calls
                 ]
                 self.assertEqual(normalized, expected)
+
+    def test_full_auto_does_not_reenter_m01_while_solver_pumps_events(self):
+        harness = FullAutoHarness("M01")
+        harness._mag_m01_solving = True
+
+        harness._try_start_full_auto_step()
+
+        self.assertEqual(harness.calls, [])
+
+    def test_full_auto_waits_for_magnetic_interstep_feedback_delay(self):
+        harness = FullAutoHarness("M03")
+        harness._full_auto_next_start_not_before_ns = 10_500_000_000
+
+        with patch(
+            "imu_calibration.quickcal_station.window.time.monotonic_ns",
+            return_value=10_250_000_000,
+        ):
+            harness._try_start_full_auto_step()
+        self.assertEqual(harness.calls, [])
+
+        with patch(
+            "imu_calibration.quickcal_station.window.time.monotonic_ns",
+            return_value=10_500_000_000,
+        ):
+            harness._try_start_full_auto_step()
+        self.assertEqual(harness.calls, [("mag", "M03")])
 
 
 @unittest.skipIf(QuickCalWindow is None, "PySide6 is not installed in this Python environment")
