@@ -569,6 +569,53 @@ class CoordinatorCompatibilityTests(unittest.TestCase):
         self.assertIn("有效窗口不足", coordinator.step_detail[coordinator.current_index])
         coordinator.tick_timer.stop()
 
+    def test_cross_axis_rejection_is_distinguished_from_raw_stream_hints(self):
+        glove = FakeGlove()
+        robot = FakeRobot()
+        coordinator = QuickCalCoordinator(glove, robot)
+        coordinator.current_index = next(
+            index for index, step in enumerate(coordinator.steps) if step.step_id == "S01"
+        )
+        coordinator.state = RunState.WAIT_COMMIT_ACK
+        coordinator.recorder.raw_diagnostic_issues = lambda _names: [
+            "P1 THUMB_2 静止角速度峰值 9.697 rad/s"
+        ]
+        coordinator.on_ack(AckFrame(CMD_MCAL_COMMIT, 11, 10, 11, 0))
+
+        gyro_quality = []
+        for index in range(11):
+            gyro_quality.append(
+                SimpleNamespace(
+                    ok=index != 5,
+                    reject_flags=0x08 if index == 5 else 0,
+                    reject_reasons=("交叉轴耦合超限",) if index == 5 else (),
+                    window_count=44,
+                    rms_mdeg=1983 if index == 5 else 1000,
+                    max_off_axis=37 if index == 5 else 10,
+                )
+            )
+        report = SimpleNamespace(
+            factory_pass=False,
+            version=4,
+            status=11,
+            gyro_quality=tuple(gyro_quality),
+            accel_quality=(),
+            mag_all_ok=True,
+            mag_quality=SimpleNamespace(reject_reasons=(), slots=()),
+            payload=b"",
+        )
+        coordinator.on_mcal_report(report)
+
+        detail = coordinator.step_detail[coordinator.current_index]
+        self.assertEqual(coordinator.state, RunState.ABORTED)
+        self.assertIn("Flash 未写入（原有标定保留）", detail)
+        self.assertIn("最终拒绝（决定本次失败）", detail)
+        self.assertIn("MIDDLE_1", detail)
+        self.assertIn("阈值≤0.030", detail)
+        self.assertIn("旁路原始流提示（不等同于最终拒绝）", detail)
+        self.assertIn("同一 IMU 连续多次超限", detail)
+        coordinator.tick_timer.stop()
+
     def test_all_gyro_steps_use_fixed_fifteen_degree_rate(self):
         glove = FakeGlove()
         robot = FakeRobot()

@@ -78,6 +78,11 @@ class QuickCalCoordinator(QObject):
     # several consecutive type=9 frames before it can abort the stage.
     P1_IMU_CORRUPT_ACCEL_NORM_MAX_G = 0.10
     P1_IMU_FAULT_CONFIRM_FRAMES = 3
+    # Keep these host-side diagnostics aligned with the r024 firmware quality
+    # gates.  They are used only to explain a type=7 rejection; the firmware
+    # remains the authority that decides whether calibration may be committed.
+    GYRO_MAX_OFF_AXIS_X1000 = 30
+    GYRO_MAX_RMS_MDEG = 5000
 
     # Dobot base +Z points upward, so physical gravity is base -Z.  The active
     # Tool frame must be defined to match the calibration fixture axes.
@@ -1091,6 +1096,7 @@ class QuickCalCoordinator(QObject):
         passed = self.commit_ack_ok and report.factory_pass
         if not passed:
             gyro_failures = []
+            retryable_cross_axis = []
             for index, item in enumerate(report.gyro_quality):
                 if (
                     item.ok
@@ -1107,9 +1113,20 @@ class QuickCalCoordinator(QObject):
                 if not item.ok and not reason_items:
                     reason_items.append("固件判定失败但未给出 rejectFlags")
                 reasons = "、".join(reason_items)
+                off_axis_text = f"offdiag={item.max_off_axis / 1000:.3f}"
+                if item.reject_flags & 0x08:
+                    off_axis_text += (
+                        f"（阈值≤{self.GYRO_MAX_OFF_AXIS_X1000 / 1000:.3f}）"
+                    )
+                if (
+                    item.reject_flags == 0x08
+                    and item.window_count >= EXPECTED_GYRO_SEGMENTS
+                    and item.rms_mdeg <= self.GYRO_MAX_RMS_MDEG
+                ):
+                    retryable_cross_axis.append(IMU_NAMES[index])
                 gyro_failures.append(
                     f"{IMU_NAMES[index]}[{reasons}; nseg={item.window_count}; "
-                    f"RMS={item.rms_mdeg / 1000:.3f}°; offdiag={item.max_off_axis / 1000:.3f}]"
+                    f"RMS={item.rms_mdeg / 1000:.3f}°; {off_axis_text}]"
                 )
             accel_failures = [
                 f"{IMU_NAMES[index]}[residual={item.residual_x1000 / 1000:.3f}; "
@@ -1133,26 +1150,38 @@ class QuickCalCoordinator(QObject):
                 mag_failure = f"Mag失败：{'、'.join(reasons)}；{coverage}"
             raw_issues = self.recorder.raw_diagnostic_issues(IMU_NAMES)
             ack = self.commit_ack_frame
-            ack_text = (
-                f"ACK status={ack.status}, Gyro={ack.detail0}/11, "
-                f"Accel/均值字段={ack.detail1}, calSeq={ack.seq}"
-                if ack is not None
-                else "未收到 COMMIT ACK"
-            )
+            if ack is None:
+                ack_text = "未收到 COMMIT ACK"
+            else:
+                ack_text = (
+                    f"ACK status={ack.status}, Gyro={ack.detail0}/11, "
+                    f"Accel={ack.detail1}/11, calSeq={ack.seq}"
+                )
+                if ack.status != 0 and ack.seq == 0:
+                    ack_text += "（未写入 Flash，原有标定保留）"
             details = [
                 ack_text,
                 f"type=7 v{report.version}, status={report.status}",
             ]
             if gyro_failures:
-                details.append("Gyro失败：" + "；".join(gyro_failures))
+                details.append("最终拒绝（决定本次失败）— Gyro：" + "；".join(gyro_failures))
             if accel_failures:
-                details.append("Accel失败：" + "；".join(accel_failures))
+                details.append("最终拒绝（决定本次失败）— Accel：" + "；".join(accel_failures))
             if mag_failure:
-                details.append(mag_failure)
+                details.append("最终拒绝（决定本次失败）— " + mag_failure)
             if raw_issues:
-                details.append("原始流提示：" + "；".join(raw_issues[:12]))
+                details.append(
+                    "旁路原始流提示（不等同于最终拒绝）："
+                    + "；".join(raw_issues[:12])
+                )
+            if retryable_cross_axis:
+                details.append(
+                    "建议：本轮仅出现交叉轴质量超限且有效窗口、RMS正常，"
+                    "先保持装夹不变重新完整标定；同一 IMU 连续多次超限时，"
+                    "再检查其固定、排线和传感器。"
+                )
             self.abort(
-                "参数求解/Flash 未通过｜" + "｜".join(details)
+                "标定质量未通过，Flash 未写入（原有标定保留）｜" + "｜".join(details)
             )
             return
         detail = f"Gyro 11/11，Accel 11/11，Mag通过，Flash seq={report.flash_sequence}，平均 RMS={report.mean_rms_mdeg / 1000:.3f}°"

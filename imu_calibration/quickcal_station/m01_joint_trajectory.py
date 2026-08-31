@@ -217,22 +217,58 @@ def _matrix_from_pose(pose: Pose) -> np.ndarray:
 
 
 def _rotation_vector_deg(reference: np.ndarray, current: np.ndarray) -> np.ndarray:
+    """Return the SO(3) logarithm without becoming singular at 180 degrees.
+
+    The usual skew/sin(angle) formula is undefined at pi.  M01's damped
+    numerical solver can legitimately evaluate a temporary candidate near
+    that point, especially when the controller reports Euler angles close to
+    Ry=-90 degrees.  Use the skew part where it is well conditioned and the
+    symmetric/diagonal part at pi instead of aborting the whole calibration.
+    """
     relative = reference.T @ current
     cosine = max(-1.0, min(1.0, (float(np.trace(relative)) - 1.0) / 2.0))
-    angle = math.acos(cosine)
-    if angle < 1e-9:
-        return np.zeros(3)
-    sine = math.sin(angle)
-    if abs(sine) < 1e-7:
-        raise ValueError("M01 rotation-vector extraction reached 180 degrees")
-    axis = np.asarray(
+    skew = np.asarray(
         (
             relative[2, 1] - relative[1, 2],
             relative[0, 2] - relative[2, 0],
             relative[1, 0] - relative[0, 1],
         ),
         dtype=float,
-    ) / (2.0 * sine)
+    ) / 2.0
+    sine = float(np.linalg.norm(skew))
+    angle = math.atan2(sine, cosine)
+    if angle < 1e-9:
+        return np.zeros(3)
+
+    if sine > 1e-7:
+        axis = skew / sine
+    else:
+        # At pi the skew part vanishes, but R + I = 2 aa^T still contains the
+        # rotation axis.  Start with its largest component to avoid dividing
+        # by a small value.  The axis sign is immaterial at exactly pi; for a
+        # near-pi input preserve the sign indicated by the residual skew.
+        diagonal = np.maximum(0.0, (np.diag(relative) + 1.0) / 2.0)
+        largest = int(np.argmax(diagonal))
+        axis = np.zeros(3, dtype=float)
+        axis[largest] = math.sqrt(float(diagonal[largest]))
+        if axis[largest] < 1e-8:
+            # This can only occur for a badly non-orthogonal input matrix.
+            # The eigenvector for eigenvalue 1 supplies the invariant axis.
+            eigenvalues, eigenvectors = np.linalg.eig(relative)
+            largest = int(np.argmin(np.abs(eigenvalues - 1.0)))
+            axis = np.real(eigenvectors[:, largest])
+        else:
+            others = [index for index in range(3) if index != largest]
+            for index in others:
+                axis[index] = (
+                    relative[largest, index] + relative[index, largest]
+                ) / (4.0 * axis[largest])
+        norm = float(np.linalg.norm(axis))
+        if norm < 1e-8 or not np.isfinite(norm):
+            raise ValueError("M01 received an invalid orientation matrix")
+        axis /= norm
+        if sine > 0.0 and float(axis @ skew) < 0.0:
+            axis = -axis
     return axis * math.degrees(angle)
 
 

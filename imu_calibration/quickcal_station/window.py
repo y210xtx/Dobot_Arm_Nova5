@@ -151,14 +151,18 @@ M01_TRAJECTORY_CACHE_PATH = (
     Path(__file__).resolve().parents[1] / "m01_trajectory_cache.local.json"
 )
 MAG_YAW_SAFE_DEG = 45.0
-MAG_TARGET_RATE_DEG_S = {"M02": 9.0, "M03": 9.0}
+MAG_TARGET_RATE_DEG_S = {"M02": 10.5, "M03": 10.5}
 # MoveJog("") decelerates instead of stopping at the current feedback angle.
-# On the station arm the observed braking travel is about 6.7 degrees at the
-# M02/M03 jog speed, so request each stop before the nominal endpoint/neutral.
-MAG_YAW_STOP_LEAD_DEG = 7.0
+# The latest station trace shows only about 0.68 degrees of braking travel at
+# 9 deg/s.  Use a conservative one-degree outer lead, then measure that stop
+# and adapt the neutral-return lead for the same run.
+MAG_YAW_STOP_LEAD_DEG = 1.0
+MAG_YAW_RETURN_LEAD_MIN_DEG = 0.5
+MAG_YAW_RETURN_LEAD_MAX_DEG = 2.5
+MAG_YAW_RETURN_LEAD_MARGIN_DEG = 0.2
 # Do not reverse on the first idle feedback packet.  Require a short continuous
 # idle window so the controller has completed its jog deceleration first.
-MAG_YAW_TURN_SETTLE_S = 0.5
+MAG_YAW_TURN_SETTLE_S = 0.25
 # M01 is a two-frequency, phase-shifted overlay.  J2/J3/J4 generate pitch
 # around their real common mechanical axis while J6 generates roll.  Runtime
 # constrained FK solving fixes J1/J5 and the entry TCP XYZ.
@@ -314,6 +318,8 @@ class QuickCalWindow(QMainWindow):
         self._mag_m04_motion_since_ns = 0
         self._mag_segment_index = -1
         self._mag_pending_segment_index = -1
+        self._mag_yaw_outer_stop_command_deg = 0.0
+        self._mag_yaw_return_stop_lead_deg = MAG_YAW_STOP_LEAD_DEG
         self._mag_reference_pose: tuple[float, ...] | None = None
         self._mag_reference_joints: tuple[float, ...] | None = None
         self._mag_m01_joint_trajectory = None
@@ -2745,6 +2751,8 @@ class QuickCalWindow(QMainWindow):
         self._mag_phase_started_ns = now
         self._mag_segment_index = -1
         self._mag_pending_segment_index = -1
+        self._mag_yaw_outer_stop_command_deg = 0.0
+        self._mag_yaw_return_stop_lead_deg = MAG_YAW_STOP_LEAD_DEG
         # Capture the actual entry pose and joints. M01 fixes J1/J5 and queues
         # constrained J2/J3/J4 pitch with simultaneous J6 roll.
         self._mag_reference_pose = tuple(state.pose)
@@ -3447,11 +3455,27 @@ class QuickCalWindow(QMainWindow):
                 MAG_YAW_TURN_SETTLE_S * 1_000_000_000
             ):
                 return
+            yaw_deg = self._relative_tool_axis_deg(
+                self._mag_reference_pose, state.pose, "Rx"
+            )
+            signed_yaw_deg = yaw_deg if step_id == "M02" else -yaw_deg
+            braking_deg = max(
+                0.0, signed_yaw_deg - self._mag_yaw_outer_stop_command_deg
+            )
+            self._mag_yaw_return_stop_lead_deg = max(
+                MAG_YAW_RETURN_LEAD_MIN_DEG,
+                min(
+                    MAG_YAW_RETURN_LEAD_MAX_DEG,
+                    braking_deg + MAG_YAW_RETURN_LEAD_MARGIN_DEG,
+                ),
+            )
             index = self._mag_pending_segment_index
             self._mag_phase = "capturing"
             self._mag_phase_started_ns = now
             self._append_log(
-                f"{step_id} 已连续停稳 {MAG_YAW_TURN_SETTLE_S:.1f} 秒，开始反向段",
+                f"{step_id} 已连续停稳 {MAG_YAW_TURN_SETTLE_S:.2f} 秒，"
+                f"外端 Tool Rx={yaw_deg:+.2f}°，实测制动行程 {braking_deg:.2f}°，"
+                f"回中制动预留 {self._mag_yaw_return_stop_lead_deg:.2f}°，开始反向段",
                 "good",
             )
             self._start_mag_segment(step_id, index, state)
@@ -3472,6 +3496,7 @@ class QuickCalWindow(QMainWindow):
                 # five-second half-cycle is retained as a fallback if the jog
                 # speed calibration is slower than expected.
                 if signed_yaw_deg >= stop_at_deg or segment_elapsed_s >= 5.0:
+                    self._mag_yaw_outer_stop_command_deg = signed_yaw_deg
                     self._append_log(
                         f"{step_id} 外端开始制动：Tool Rx={yaw_deg:+.2f}°，"
                         f"预留约 {MAG_YAW_STOP_LEAD_DEG:.1f}° 减速行程",
@@ -3480,7 +3505,7 @@ class QuickCalWindow(QMainWindow):
                     self._start_mag_segment(step_id, 1, state)
             elif (
                 self._mag_segment_index == 1
-                and signed_yaw_deg <= MAG_YAW_STOP_LEAD_DEG
+                and signed_yaw_deg <= self._mag_yaw_return_stop_lead_deg
             ):
                 if not self.robot.stop_tool_jog():
                     self._fail_mag_auto_action(f"{step_id} 回中段提前制动失败")

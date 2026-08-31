@@ -6,6 +6,8 @@ import unittest
 import numpy as np
 
 from imu_calibration.quickcal_station.m01_joint_trajectory import (
+    _axis_rotation,
+    _rotation_vector_deg,
     load_m01_joint_trajectory_cache,
     save_m01_joint_trajectory_cache,
     solve_m01_joint_trajectory,
@@ -26,6 +28,27 @@ def matrix_to_pose(matrix, xyz):
 
 
 class M01JointTrajectoryTests(unittest.TestCase):
+    def test_rotation_vector_handles_exact_180_degree_rotation(self):
+        axis = np.asarray((1.0, -2.0, 3.0), dtype=float)
+        axis /= np.linalg.norm(axis)
+        rotation = _axis_rotation(axis, 180.0)
+
+        vector = _rotation_vector_deg(np.eye(3), rotation)
+
+        self.assertAlmostEqual(float(np.linalg.norm(vector)), 180.0, places=7)
+        reconstructed = _axis_rotation(vector, float(np.linalg.norm(vector)))
+        np.testing.assert_allclose(reconstructed, rotation, atol=1e-10)
+
+    def test_rotation_vector_preserves_near_180_degree_axis_direction(self):
+        axis = np.asarray((-0.3, 0.4, 0.5), dtype=float)
+        axis /= np.linalg.norm(axis)
+        rotation = _axis_rotation(axis, 179.9999999)
+
+        vector = _rotation_vector_deg(np.eye(3), rotation)
+
+        self.assertAlmostEqual(float(np.linalg.norm(vector)), 179.9999999, places=6)
+        self.assertGreater(float(vector @ axis), 0.0)
+
     def test_solver_fixes_j1_j5_and_overlays_j234_with_j6(self):
         reference_joints = (10.0, 20.0, 30.0, 40.0, 50.0, 60.0)
         reference_pose = (100.0, 200.0, 300.0, 0.0, 0.0, 0.0)

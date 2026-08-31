@@ -26,6 +26,7 @@ try:
         MAG_M04_MOTION_GRACE_S,
         MAG_M04_STOP_SETTLE_S,
         MAG_TRAJECTORIES,
+        MAG_TARGET_RATE_DEG_S,
         MAG_YAW_STOP_LEAD_DEG,
         MAG_YAW_TURN_SETTLE_S,
         NEUTRAL_RETURN_SPEED_PERCENT,
@@ -36,7 +37,7 @@ except ModuleNotFoundError as exc:
         raise
     QuickCalCoordinator = QuickCalWindow = RobotState = RunState = None
     MAG_AUTO_STEPS = MAG_M01_BLEND_PERCENT = MAG_M01_J6_SAFE_DEG = None
-    MAG_M01_POSE_WAYPOINTS = MAG_TRAJECTORIES = None
+    MAG_M01_POSE_WAYPOINTS = MAG_TARGET_RATE_DEG_S = MAG_TRAJECTORIES = None
     MAG_M01_SEGMENT_S = MAG_M01_SUBSEGMENTS_PER_LEG = None
     MAG_M01_TURN_BLEND_PERCENT = MAG_M01_XYZ_TOLERANCE_MM = None
     MAG_M01_VELOCITY_PERCENT = None
@@ -139,6 +140,8 @@ class MagYawMotionHarness:
         self._mag_phase_started_ns = 0
         self._mag_segment_index = 0
         self._mag_pending_segment_index = -1
+        self._mag_yaw_outer_stop_command_deg = 0.0
+        self._mag_yaw_return_stop_lead_deg = MAG_YAW_STOP_LEAD_DEG
         self._mag_reference_pose = (0.0,) * 6
         self._auto_action_stable_since_ns = 0
         self._mag_jog_active = True
@@ -654,32 +657,34 @@ class GyroMotionParameterTests(unittest.TestCase):
             (("Rx", False, 5.0), ("Rx", True, 5.0)),
         )
         self.assertEqual(MAG_TRAJECTORIES["M04"], ())
-        self.assertEqual(MAG_YAW_STOP_LEAD_DEG, 7.0)
-        self.assertEqual(MAG_YAW_TURN_SETTLE_S, 0.5)
+        self.assertEqual(MAG_TARGET_RATE_DEG_S, {"M02": 10.5, "M03": 10.5})
+        self.assertEqual(MAG_YAW_STOP_LEAD_DEG, 1.0)
+        self.assertEqual(MAG_YAW_TURN_SETTLE_S, 0.25)
 
     def test_m02_brakes_early_waits_for_continuous_idle_then_reverses(self):
         harness = MagYawMotionHarness("M02")
 
-        harness.update_at(4.2, 38.0, mode=8, angular=9.0)
+        harness.update_at(4.4, 44.0, mode=8, angular=10.5)
         self.assertEqual(harness.robot.stops, 1)
         self.assertEqual(harness._mag_phase, "wait_segment_stop")
         self.assertEqual(harness._mag_pending_segment_index, 1)
 
-        harness.update_at(5.0, 44.7)
-        harness.update_at(5.49, 44.7)
+        harness.update_at(4.6, 44.8)
+        harness.update_at(4.84, 44.8)
         self.assertEqual(harness.robot.switches, [])
-        harness.update_at(5.5, 44.7)
+        harness.update_at(4.85, 44.8)
 
         self.assertEqual(harness._mag_phase, "capturing")
         self.assertEqual(harness._mag_segment_index, 1)
         self.assertEqual(harness.robot.switches, [("Rx", False, 0, 1)])
+        self.assertAlmostEqual(harness._mag_yaw_return_stop_lead_deg, 1.0)
         self.assertEqual(harness.fail_message, "")
 
     def test_m03_return_leg_brakes_before_crossing_neutral(self):
         harness = MagYawMotionHarness("M03")
         harness._mag_segment_index = 1
 
-        harness.update_at(9.4, -7.0, mode=8, angular=9.0)
+        harness.update_at(9.4, -1.0, mode=8, angular=10.5)
 
         self.assertEqual(harness.robot.stops, 1)
         self.assertEqual(harness._mag_phase, "capture_final_stop")
